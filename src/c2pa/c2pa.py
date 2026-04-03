@@ -359,6 +359,19 @@ SignerCallback = ctypes.CFUNCTYPE(
         ctypes.c_ubyte), ctypes.c_size_t, ctypes.POINTER(
             ctypes.c_ubyte), ctypes.c_size_t)
 
+# Callback type for DynamicAssertion content generation (FFI).
+# Signature: (context, label, reserve_size, partial_claim_json,
+#             out_data, out_data_max_len) -> bytes_written or -1
+DynamicAssertionCallback = ctypes.CFUNCTYPE(
+    ctypes.c_ssize_t,                      # return
+    ctypes.c_void_p,                       # context
+    ctypes.c_char_p,                       # label
+    ctypes.c_size_t,                       # reserve_size
+    ctypes.c_char_p,                       # partial_claim_json
+    ctypes.POINTER(ctypes.c_ubyte),        # out_data
+    ctypes.c_size_t,                       # out_data_max_len
+)
+
 
 class StreamContext(ctypes.Structure):
     """Opaque structure for stream context."""
@@ -660,6 +673,15 @@ _setup_function(
     _lib.c2pa_signature_free, [
         ctypes.POINTER(
             ctypes.c_ubyte)], None)
+# DynamicAssertion FFI
+_setup_function(
+    _lib.c2pa_signer_add_dynamic_assertion,
+    [ctypes.POINTER(C2paSigner),     # signer_ptr
+     ctypes.c_void_p,                # context
+     DynamicAssertionCallback,       # callback
+     ctypes.c_char_p,               # label
+     ctypes.c_size_t],              # reserve_size
+    ctypes.c_int)
 _setup_function(
     _lib.c2pa_builder_supported_mime_types,
     [ctypes.POINTER(ctypes.c_size_t)],
@@ -2978,6 +3000,7 @@ class Signer(ManagedResource):
         super().__init__()
 
         self._callback_cb = None
+        self._dynamic_assertion_cbs = []  # prevent GC of ctypes callbacks
 
         if not signer_ptr:
             raise C2paError("Invalid signer pointer: pointer is null")
@@ -3007,6 +3030,61 @@ class Signer(ManagedResource):
             "Failed to get reserve size", check=lambda r: r < 0)
 
         return result
+
+    def add_dynamic_assertion(
+        self,
+        callback,
+        label="cawg.identity",
+        reserve_size=8192,
+    ):
+        """Register a dynamic assertion callback on this signer.
+
+        During signing the callback is invoked with the partial claim
+        (all assertion hashed URIs) so it can produce assertion content
+        that references real assertion hashes.
+
+        Args:
+            callback: ``(label: str, reserve_size: int,
+                partial_claim: list[dict]) -> bytes``
+                Must return CBOR-encoded assertion content.
+                Each dict in *partial_claim* has keys
+                ``url``, ``alg``, ``hash`` (base64).
+            label: Assertion label (default ``"cawg.identity"``).
+            reserve_size: Bytes to reserve for the placeholder.
+
+        Raises:
+            C2paError: If registration fails.
+        """
+        self._ensure_valid_state()
+
+        def _wrapped(ctx, c_label, c_reserve, c_json, out_ptr, out_max):
+            try:
+                py_label = c_label.decode("utf-8") if c_label else label
+                py_reserve = int(c_reserve)
+                py_json = c_json.decode("utf-8") if c_json else "[]"
+                partial_claim = json.loads(py_json)
+                result_bytes = callback(py_label, py_reserve, partial_claim)
+                n = len(result_bytes)
+                if n > out_max:
+                    return -1
+                ctypes.memmove(out_ptr, result_bytes, n)
+                return n
+            except Exception:
+                return -1
+
+        cb = DynamicAssertionCallback(_wrapped)
+        self._dynamic_assertion_cbs.append(cb)
+
+        label_bytes = label.encode("utf-8") if isinstance(label, str) else label
+        result = _lib.c2pa_signer_add_dynamic_assertion(
+            self._handle,
+            None,  # context
+            cb,
+            label_bytes,
+            reserve_size,
+        )
+        if result != 0:
+            _parse_operation_result_for_error(None)
 
 
 class Builder(ManagedResource):
@@ -3608,7 +3686,10 @@ class Builder(ManagedResource):
                         format, source_stream, dest_stream,
                         signer=signer,
                     )
-                elif self._has_context_signer:
+                elif self._has_context_signer or self._context is not None:
+                    # Try context-based signing.  The Rust side may have a
+                    # signer from Settings (e.g. cawg_x509_signer) even when
+                    # _has_context_signer is False.  Let the FFI report errors.
                     manifest_bytes = self._sign_internal(format, source_stream, dest_stream)
                 else:
                     raise C2paError(
