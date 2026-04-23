@@ -53,6 +53,7 @@ _REQUIRED_FUNCTIONS = [
     'c2pa_reader_with_stream',
     'c2pa_reader_with_fragment',
     'c2pa_reader_with_manifest_data_and_stream',
+    'c2pa_reader_from_fragmented_files',
     'c2pa_reader_is_embedded',
     'c2pa_reader_remote_url',
     'c2pa_reader_supported_mime_types',
@@ -590,6 +591,13 @@ _setup_function(
     _lib.c2pa_reader_remote_url,
     [ctypes.POINTER(C2paReader)],
     ctypes.c_void_p
+)
+_setup_function(
+    _lib.c2pa_reader_from_fragmented_files,
+    [ctypes.c_char_p,                    # asset_path
+     ctypes.POINTER(ctypes.c_char_p),    # fragments
+     ctypes.c_size_t],                   # fragments_count
+    ctypes.POINTER(C2paReader)
 )
 
 # Set up Builder function prototypes
@@ -2262,6 +2270,78 @@ class Reader(ManagedResource):
             )
         except C2paError.ManifestNotFound:
             return None
+
+    @classmethod
+    def from_fragmented_files(
+        cls,
+        asset_path: Union[str, Path],
+        fragments: list[Union[str, Path]],
+    ) -> "Reader":
+        """Create a Reader for a fragmented BMFF asset set.
+
+        Read-side counterpart to :py:meth:`Builder.sign_fragmented`.
+        Wraps the ``c2pa_reader_from_fragmented_files`` FFI (which in
+        turn calls ``c2pa::Reader::with_fragmented_files``) so DASH/HLS
+        segmented asset sets (init segment + media fragments, typically
+        ``.m4s`` / ``.cmfv``) can be validated as a single unit.
+
+        Args:
+            asset_path: Filesystem path to the init segment
+                (e.g. ``init.m4s``).
+            fragments: List of filesystem paths to the media fragments
+                that belong to this init segment. Order does not matter;
+                c2pa-rs resolves fragment ordering from the BMFF box
+                tree internally. May be empty if the init segment alone
+                carries the manifest (rare).
+
+        Returns:
+            A ready-to-use ``Reader`` whose ``json()``/``detailed_json()``
+            describe the signed fragmented asset.
+
+        Raises:
+            C2paError: If the asset could not be opened or validated.
+            C2paError.ManifestNotFound: If no JUMBF/C2PA manifest was
+                found in the asset.
+        """
+        asset_path_bytes = os.fspath(asset_path).encode("utf-8")
+
+        fragments_count = len(fragments)
+        if fragments_count == 0:
+            frag_array = None
+            frag_array_ptr = None
+        else:
+            frag_bytes_list = [
+                os.fspath(p).encode("utf-8") for p in fragments
+            ]
+            frag_array = (ctypes.c_char_p * fragments_count)(*frag_bytes_list)
+            frag_array_ptr = ctypes.cast(
+                frag_array, ctypes.POINTER(ctypes.c_char_p)
+            )
+
+        reader_ptr = _lib.c2pa_reader_from_fragmented_files(
+            asset_path_bytes,
+            frag_array_ptr,
+            fragments_count,
+        )
+        _check_ffi_operation_result(
+            reader_ptr,
+            Reader._ERROR_MESSAGES['reader_error'].format(
+                "from_fragmented_files returned null"
+            ),
+        )
+
+        # Skip __init__ (file/stream setup it does doesn't apply here)
+        # and construct a minimal Reader object directly.
+        reader = cls.__new__(cls)
+        ManagedResource.__init__(reader)
+        reader._own_stream = None
+        reader._backing_file = None
+        reader._manifest_json_str_cache = None
+        reader._manifest_data_cache = None
+        reader._context = None
+        reader._handle = reader_ptr
+        reader._lifecycle_state = LifecycleState.ACTIVE
+        return reader
 
     @overload
     def __init__(

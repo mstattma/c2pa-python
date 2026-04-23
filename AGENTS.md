@@ -37,6 +37,7 @@ The native library (`libc2pa_c.so` / `.dylib` / `.dll`) is built from the `c2pa-
 | `Signer.add_dynamic_assertion()` | ~line 3045 | Python API: register a callback, invokes C FFI `c2pa_signer_add_dynamic_assertion` |
 | `has_signer` fix | ~line 3700 | `_sign_common` tries context-based signing when `self._context is not None` |
 | `Builder.sign_fragmented()` | ~line 3782 | Python API for fragmented BMFF signing; invokes C FFI `c2pa_builder_sign_fragmented` |
+| `Reader.from_fragmented_files()` | ~line 2270 | Python classmethod for fragmented BMFF read; invokes C FFI `c2pa_reader_from_fragmented_files`. Read-side counterpart to `Builder.sign_fragmented` — takes the init segment path plus an explicit list of fragment paths and returns a `Reader` whose `json()` / `detailed_json()` describe the signed segmented asset. |
 
 ### Rust — C FFI (`c2pa-rs/c2pa_c_ffi/src/c_api.rs`)
 
@@ -47,6 +48,7 @@ The native library (`libc2pa_c.so` / `.dylib` / `.dll`) is built from the `c2pa-
 | `FfiDynamicSignerV2` | Wraps inner `Signer`, delegates all methods, overrides `dynamic_assertions()` |
 | `c2pa_signer_add_dynamic_assertion()` | Exported FFI function |
 | `c2pa_builder_sign_fragmented()` | Exported FFI function — wraps `Builder::sign_fragmented_files`, reads back manifest bytes from the signed init segment via `jumbf_io::load_jumbf_from_file` and returns them through `manifest_bytes_ptr` |
+| `c2pa_reader_from_fragmented_files()` | Exported FFI function — wraps `Reader::from_context(Context::default()).with_fragmented_files(path, fragments)` and returns a tracked `*mut C2paReader`. Fragment paths are passed as an array of null-terminated UTF-8 C strings + count (same convention as `c2pa_*_supported_mime_types`). |
 
 ### Rust — SDK (`c2pa-rs/sdk/src/`)
 
