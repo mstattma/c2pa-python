@@ -36,6 +36,7 @@ The native library (`libc2pa_c.so` / `.dylib` / `.dll`) is built from the `c2pa-
 | `DynamicAssertionCallback` type | ~line 370 | ctypes callback type for the FFI |
 | `Signer.add_dynamic_assertion()` | ~line 3045 | Python API: register a callback, invokes C FFI `c2pa_signer_add_dynamic_assertion` |
 | `has_signer` fix | ~line 3700 | `_sign_common` tries context-based signing when `self._context is not None` |
+| `Builder.sign_fragmented()` | ~line 3782 | Python API for fragmented BMFF signing; invokes C FFI `c2pa_builder_sign_fragmented` |
 
 ### Rust — C FFI (`c2pa-rs/c2pa_c_ffi/src/c_api.rs`)
 
@@ -45,6 +46,7 @@ The native library (`libc2pa_c.so` / `.dylib` / `.dll`) is built from the `c2pa-
 | `FfiDynamicAssertion` | Implements `DynamicAssertion` trait, serializes `PartialClaim` as JSON, invokes C callback |
 | `FfiDynamicSignerV2` | Wraps inner `Signer`, delegates all methods, overrides `dynamic_assertions()` |
 | `c2pa_signer_add_dynamic_assertion()` | Exported FFI function |
+| `c2pa_builder_sign_fragmented()` | Exported FFI function — wraps `Builder::sign_fragmented_files`, reads back manifest bytes from the signed init segment via `jumbf_io::load_jumbf_from_file` and returns them through `manifest_bytes_ptr` |
 
 ### Rust — SDK (`c2pa-rs/sdk/src/`)
 
@@ -53,6 +55,7 @@ The native library (`libc2pa_c.so` / `.dylib` / `.dll`) is built from the `c2pa-
 | `__N` suffix stripping in referenced_assertions matching | `identity/builder/identity_assertion_builder.rs` | `cawg_x509_signer` referenced_assertions `"c2pa.soft-binding"` now matches `c2pa.soft-binding__1` etc. |
 | `replace_assertion_by_instance()` | `claim.rs` | New method: replaces assertion at a specific instance index |
 | Label dedup in `write_dynamic_assertions` | `store.rs` | Resolves `__N`-suffixed labels from claim URIs so multiple DAs with same label target correct placeholders |
+| `.m4s` + `.cmfv` added to BMFF `SUPPORTED_TYPES` | `asset_handlers/bmff_io.rs` | Required for DASH/HLS segmented asset sets (`sign_fragmented`) to pass `get_supported_file_extension` inside `save_to_bmff_fragmented` |
 
 ## Build & Install
 

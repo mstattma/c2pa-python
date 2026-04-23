@@ -68,6 +68,7 @@ _REQUIRED_FUNCTIONS = [
     'c2pa_builder_to_archive',
     'c2pa_builder_sign',
     'c2pa_builder_sign_context',
+    'c2pa_builder_sign_fragmented',
     'c2pa_builder_from_context',
     'c2pa_builder_with_definition',
     'c2pa_builder_with_archive',
@@ -767,6 +768,16 @@ _setup_function(
      ctypes.c_char_p,
      ctypes.POINTER(C2paStream),
      ctypes.POINTER(C2paStream),
+     ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte))],
+    ctypes.c_int64
+)
+_setup_function(
+    _lib.c2pa_builder_sign_fragmented,
+    [ctypes.POINTER(C2paBuilder),
+     ctypes.POINTER(C2paSigner),
+     ctypes.c_char_p,  # asset_path
+     ctypes.c_char_p,  # fragments_glob
+     ctypes.c_char_p,  # output_dir
      ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte))],
     ctypes.c_int64
 )
@@ -3767,6 +3778,95 @@ class Builder(ManagedResource):
             raise C2paError(
                 "First argument must be a Signer or a format string (MIME type)."
             )
+
+    def sign_fragmented(
+        self,
+        signer: Signer,
+        asset_path: Union[str, Path],
+        fragments_glob: Union[str, Path],
+        output_dir: Union[str, Path],
+    ) -> bytes:
+        """Sign a fragmented BMFF asset set (init segment + media fragments).
+
+        Wraps ``c2pa::Builder::sign_fragmented_files`` via the
+        ``c2pa_builder_sign_fragmented`` FFI. The output directory is
+        populated with a signed copy of the init segment (containing the
+        embedded JUMBF manifest) and fragment copies containing
+        merkle-tree placeholders per the C2PA BMFF fragmented-hash
+        algorithm.
+
+        Args:
+            signer: The signer to use. Must be a ``Signer`` created with
+                an explicit signing callback; context-only signers are
+                not supported on this code path yet.
+            asset_path: Filesystem path to the init segment (or a glob
+                pattern for multi-rendition asset sets — passed through
+                verbatim to c2pa-rs).
+            fragments_glob: Filename glob pattern (relative to the init
+                segment's directory) matching the media fragments —
+                e.g. ``"seg-*.m4s"``. Must NOT match the init segment
+                itself.
+            output_dir: Directory where the signed output will be
+                written. c2pa-rs places output at
+                ``<output_dir>/<init_parent_dir_name>/...``; callers
+                wanting a flat layout must post-process.
+
+        Returns:
+            The embedded manifest bytes (the same data that was written
+            into the output init segment's JUMBF box).
+
+        Raises:
+            C2paError: If there was an error during signing or reading
+                the manifest bytes back.
+        """
+        self._ensure_valid_state()
+        if not hasattr(signer, "_handle") or not signer._handle:
+            raise C2paError("Invalid or closed signer")
+
+        asset_path_bytes = os.fspath(asset_path).encode("utf-8")
+        fragments_glob_bytes = os.fspath(fragments_glob).encode("utf-8")
+        output_dir_bytes = os.fspath(output_dir).encode("utf-8")
+
+        manifest_bytes_ptr = ctypes.POINTER(ctypes.c_ubyte)()
+        try:
+            result = _lib.c2pa_builder_sign_fragmented(
+                self._handle,
+                signer._handle,
+                asset_path_bytes,
+                fragments_glob_bytes,
+                output_dir_bytes,
+                ctypes.byref(manifest_bytes_ptr),
+            )
+            # The Rust FFI consumes the builder pointer on sign; mark
+            # ours consumed too so subsequent methods raise clearly.
+            self._mark_consumed()
+        except Exception as e:
+            self._mark_consumed()
+            raise C2paError(f"Error during fragmented signing: {e}")
+
+        _check_ffi_operation_result(
+            result,
+            "Error during fragmented signing",
+            check=lambda r: r < 0,
+        )
+
+        manifest_bytes = b""
+        if manifest_bytes_ptr and result > 0:
+            try:
+                temp_buffer = (ctypes.c_ubyte * result)()
+                ctypes.memmove(temp_buffer, manifest_bytes_ptr, result)
+                manifest_bytes = bytes(temp_buffer)
+            except Exception:
+                manifest_bytes = b""
+            finally:
+                try:
+                    _lib.c2pa_manifest_bytes_free(manifest_bytes_ptr)
+                except Exception:
+                    logger.error(
+                        "Failed to release native manifest bytes memory"
+                    )
+
+        return manifest_bytes
 
     @overload
     def sign_file(
