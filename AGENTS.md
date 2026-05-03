@@ -99,6 +99,27 @@ pip install -e .          # re-installs with new library
 
 If you only modify `src/c2pa/c2pa.py`, a re-install is sufficient (editable install picks up changes automatically for `-e .`).
 
+### Native library staging — foot-gun for editable installs
+
+The Python loader (`src/c2pa/lib.py::dynamically_load_library`) looks for the native library in a fixed list of locations; the canonical one for editable installs is **`src/c2pa/libs/<lib_name>`** (i.e. `libc2pa_c.so` on Linux, `libc2pa_c.dylib` on macOS, `c2pa_c.dll` on Windows). When that path is empty the loader raises:
+
+```
+RuntimeError: Could not find libc2pa_c.so in any of the search paths
+```
+
+`setup.py`'s `bdist_wheel` flow (the path taken by `python -m build --wheel`, `pip wheel .`, or any other invocation of the wheel builder) ends with a `finally: shutil.rmtree(PACKAGE_LIBS_DIR)` step that **wipes `src/c2pa/libs/` after packaging the wheel** — a clean-up inherited from the upstream contentauth flow that treats the dir as a transient build artifact. In an editable install (`pip install -e .`), this wipe destroys the runtime location the loader needs, and any long-running consumer (a uvicorn server importing `c2pa`, a Jupyter kernel, etc.) will fail on next `import c2pa`.
+
+**After ANY of the following actions**, re-run `python build_native.py` to re-stage the native library:
+
+- `python -m build --wheel` (the `python-build` PEP 517 frontend)
+- `pip wheel .`
+- Direct `python setup.py bdist_wheel`
+- Any other invocation of the wheel builder against this tree
+
+The cargo build artifact at `c2pa-rs/target/release/<lib>` survives the rmtree (cargo's cache lives in a separate tree), so re-staging is fast — `build_native.py` just re-copies; it doesn't re-cargo-build.
+
+The `stardustproof-cli` release script (`stardustproof-cli/scripts/build_release.py`) auto-restores `src/c2pa/libs/` after its own wheel build of the c2pa-python sibling checkout. If you bypass that script and run `python -m build --wheel` against this tree directly, you have to re-stage manually.
+
 ## Rules
 
 - **Do not modify upstream c2pa-python files** unless necessary for the patches. Keep changes minimal and well-commented for future PR submission.
