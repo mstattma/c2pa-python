@@ -126,7 +126,7 @@ The `stardustproof-cli` release script (`stardustproof-cli/scripts/build_release
 - The `c2pa-rs` submodule is pinned to a specific commit on `feat/dynamic-assertion-ffi`. Update with `cd c2pa-rs && git pull origin feat/dynamic-assertion-ffi` then rebuild.
 - The `src/c2pa/libs/` directory is gitignored — the native library is built locally per platform.
 - The `DynamicAssertionCallback` GC prevention pattern (storing ctypes callback refs in `self._dynamic_assertion_cbs`) follows the same pattern as `Signer.from_callback()`.
-- `build_native.py` tries `cargo` on PATH, then `~/.cargo/bin/cargo`. It builds with `--features file_io`.
+- `build_native.py` and the wheel build path try `cargo` on PATH, then `~/.cargo/bin/cargo`. They build with `--locked --features file_io`. Set `C2PA_CARGO_BUILD_TIMEOUT_SECONDS` to override the default 600-second cargo timeout.
 
 ## Testing
 

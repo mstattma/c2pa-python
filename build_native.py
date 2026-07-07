@@ -19,6 +19,7 @@ import subprocess
 import shutil
 import sys
 import platform
+import os
 from pathlib import Path
 
 C2PA_RS_DIR = Path(__file__).parent / "c2pa-rs"
@@ -61,8 +62,9 @@ def main():
     print()
 
     result = subprocess.run(
-        [cargo, "build", "--release", "-p", "c2pa-c-ffi", "--features", "file_io"],
+        [cargo, "build", "--release", "--locked", "-p", "c2pa-c-ffi", "--features", "file_io"],
         cwd=str(C2PA_RS_DIR),
+        timeout=int(os.environ.get("C2PA_CARGO_BUILD_TIMEOUT_SECONDS", "600")),
     )
     if result.returncode != 0:
         print("\nERROR: Build failed.")

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import platform
 import shutil
+import os
 from pathlib import Path
 import toml
 
@@ -84,12 +85,13 @@ def build_native_from_source() -> bool:
 
     print(f"Building native library from source ({C2PA_RS_SUBMODULE}) ...")
     try:
+        build_timeout = int(os.environ.get('C2PA_CARGO_BUILD_TIMEOUT_SECONDS', '600'))
         result = subprocess.run(
-            [cargo, 'build', '--release', '-p', 'c2pa-c-ffi', '--features', 'file_io'],
+            [cargo, 'build', '--release', '--locked', '-p', 'c2pa-c-ffi', '--features', 'file_io'],
             cwd=str(C2PA_RS_SUBMODULE),
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=build_timeout,
         )
         if result.returncode != 0:
             print(f"Cargo build failed:\n{result.stderr[-2000:]}")
@@ -98,7 +100,7 @@ def build_native_from_source() -> bool:
         print("cargo not found on PATH")
         return False
     except subprocess.TimeoutExpired:
-        print("Cargo build timed out (>600s)")
+        print(f"Cargo build timed out (>{build_timeout}s)")
         return False
 
     # Determine the library file name for this platform
