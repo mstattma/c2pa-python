@@ -16,6 +16,11 @@ on:
         description: "Optional central release workflow correlation id"
         required: false
         type: string
+      allow_unprotected_ref:
+        description: "Allow building from a non-default, unprotected ref. Use only for forked dependency release branches."
+        required: false
+        default: "false"
+        type: string
 
 permissions:
   contents: write
@@ -48,11 +53,12 @@ jobs:
         env:
           INPUT_RELEASE_VERSION: ${{ inputs.release_version }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          INPUT_ALLOW_UNPROTECTED_REF: ${{ inputs.allow_unprotected_ref || 'false' }}
           REF_PROTECTED: ${{ github.ref_protected }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          if [ "$REF_PROTECTED" != "true" ] && [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+          if [ "$REF_PROTECTED" != "true" ] && [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ] && [ "$INPUT_ALLOW_UNPROTECTED_REF" != "true" ]; then
             echo "::error::Release wheel builds are allowed only from protected refs or the default branch"
             exit 1
           fi
