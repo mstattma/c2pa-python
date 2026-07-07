@@ -1,0 +1,233 @@
+name: build-release-wheel
+run-name: c2pa-python ${{ inputs.release_version }} ${{ inputs.release_build_id || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "c2pa-python release version, for example 0.31.0+stardustproof.1"
+        required: true
+        type: string
+      release_tag:
+        description: "GitHub release tag to create or update; defaults to v<release_version>"
+        required: false
+        type: string
+      release_build_id:
+        description: "Optional central release workflow correlation id"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-wheel-${{ inputs.release_version }}
+  cancel-in-progress: false
+
+env:
+  MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:latest
+  MANYLINUX_PYTHON: /opt/python/cp311-cp311/bin/python
+  RUST_TOOLCHAIN: "1.88.0"
+  WHEEL_PLAT_NAME: manylinux_2_28_x86_64
+
+jobs:
+  build-wheel:
+    name: Build and publish release wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Validate release inputs
+        id: inputs
+        env:
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag || '' }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_PROTECTED" != "true" ] && [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            echo "::error::Release wheel builds are allowed only from protected refs or the default branch"
+            exit 1
+          fi
+          release_version="${INPUT_RELEASE_VERSION#v}"
+          if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+stardustproof\.[0-9]+$ ]]; then
+            echo "::error::release_version must match MAJOR.MINOR.PATCH+stardustproof.N, got: $release_version"
+            exit 1
+          fi
+          pyproject_version="$(python3 - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              print(tomllib.load(fh)["project"]["version"])
+          PY
+          )"
+          if [ "$pyproject_version" != "$release_version" ]; then
+            echo "::error::pyproject.toml version $pyproject_version does not match release_version $release_version"
+            exit 1
+          fi
+          release_tag="${INPUT_RELEASE_TAG:-v${release_version}}"
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+stardustproof\.[0-9]+$ ]]; then
+            echo "::error::release_tag must match vMAJOR.MINOR.PATCH+stardustproof.N, got: $release_tag"
+            exit 1
+          fi
+          echo "release_version=${release_version}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel in manylinux container
+        run: |
+          set -euo pipefail
+          fix_permissions() {
+            for path in build dist src/c2pa/libs c2pa-rs/target wheelhouse src/*.egg-info *.egg-info; do
+              if [ -e "$path" ]; then
+                sudo chown -R "$(id -u):$(id -g)" "$path"
+              fi
+            done
+          }
+          trap fix_permissions EXIT
+          rm -rf build dist src/c2pa/libs
+          docker pull "$MANYLINUX_IMAGE"
+          manylinux_image_ref="$(docker image inspect "$MANYLINUX_IMAGE" --format '{{index .RepoDigests 0}}')"
+          if [ -z "$manylinux_image_ref" ]; then
+            echo "::error::Could not resolve manylinux image digest for $MANYLINUX_IMAGE"
+            exit 1
+          fi
+          echo "MANYLINUX_IMAGE_REF=${manylinux_image_ref}" >> "$GITHUB_ENV"
+          docker run --rm \
+            -e C2PA_CARGO_BUILD_TIMEOUT_SECONDS=1800 \
+            -e MANYLINUX_PYTHON="$MANYLINUX_PYTHON" \
+            -e RUST_TOOLCHAIN="$RUST_TOOLCHAIN" \
+            -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            -e WHEEL_PLAT_NAME="$WHEEL_PLAT_NAME" \
+            -v "$PWD:/io" \
+            -w /io \
+            "$manylinux_image_ref" \
+            /bin/bash -lc 'set -euo pipefail; curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"; export PATH="$HOME/.cargo/bin:$PATH"; "$MANYLINUX_PYTHON" -m pip install --upgrade pip; "$MANYLINUX_PYTHON" -m pip install "wheel==0.45.1" "setuptools==80.9.0" "toml==0.10.2"; "$MANYLINUX_PYTHON" setup.py bdist_wheel --plat-name "$WHEEL_PLAT_NAME"; mkdir -p wheelhouse; auditwheel repair --plat "$WHEEL_PLAT_NAME" -w wheelhouse dist/*.whl; rm -f dist/*.whl; mv wheelhouse/*.whl dist/; auditwheel show dist/*.whl | tee dist/auditwheel-show.txt; "$MANYLINUX_PYTHON" -m venv /tmp/c2pa-wheel-smoke; /tmp/c2pa-wheel-smoke/bin/pip install dist/*.whl; /tmp/c2pa-wheel-smoke/bin/python -c "import c2pa; print(c2pa.__file__)" | tee dist/import-smoke.txt'
+          ls -l dist
+
+      - name: Validate wheel and write evidence
+        id: evidence
+        env:
+          RELEASE_VERSION: ${{ steps.inputs.outputs.release_version }}
+          RELEASE_TAG: ${{ steps.inputs.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' | sort)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one wheel in dist/, got ${#wheels[@]}"
+            exit 1
+          fi
+          wheel_path="${wheels[0]}"
+          wheel_name="$(basename "$wheel_path")"
+          wheel_sha256="$(sha256sum "$wheel_path" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$wheel_sha256" "$wheel_name" | tee "dist/${wheel_name}.sha256"
+          safe_release_version="${RELEASE_VERSION//+/-}"
+          bundle_name="c2pa-python-${safe_release_version}-wheel-bundle.tar.gz"
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -cf - \
+            -C dist "$wheel_name" "${wheel_name}.sha256" auditwheel-show.txt import-smoke.txt \
+            | gzip -n > "dist/${bundle_name}"
+          bundle_sha256="$(sha256sum "dist/${bundle_name}" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$bundle_sha256" "$bundle_name" | tee "dist/${bundle_name}.sha256"
+          c2pa_rs_commit="$(git -C c2pa-rs rev-parse HEAD)"
+          c2pa_rs_status="$(git submodule status --recursive c2pa-rs)"
+          generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          python_version="$(docker run --rm "$MANYLINUX_IMAGE_REF" "$MANYLINUX_PYTHON" -VV)"
+          export wheel_name wheel_sha256 bundle_name bundle_sha256 c2pa_rs_commit c2pa_rs_status generated_at python_version
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = {
+              "artifact_type": "c2pa_python_release_wheel_evidence",
+              "package_name": "c2pa-python",
+              "release_version": os.environ["RELEASE_VERSION"],
+              "release_tag": os.environ["RELEASE_TAG"],
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "source_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}",
+              "source_ref": os.environ["GITHUB_REF_NAME"],
+              "source_sha": os.environ["GITHUB_SHA"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "github_run_number": os.environ["GITHUB_RUN_NUMBER"],
+              "generated_at": os.environ["generated_at"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "python_version": os.environ["python_version"],
+              "rust_toolchain": os.environ["RUST_TOOLCHAIN"],
+              "manylinux_image": os.environ["MANYLINUX_IMAGE"],
+              "manylinux_image_ref": os.environ["MANYLINUX_IMAGE_REF"],
+              "wheel_plat_name": os.environ["WHEEL_PLAT_NAME"],
+              "c2pa_rs_submodule_commit": os.environ["c2pa_rs_commit"],
+              "c2pa_rs_submodule_status": os.environ["c2pa_rs_status"],
+              "wheel_file": os.environ["wheel_name"],
+              "wheel_sha256": os.environ["wheel_sha256"],
+              "wheel_bundle_file": os.environ["bundle_name"],
+              "wheel_bundle_sha256": os.environ["bundle_sha256"],
+          }
+          Path("dist/c2pa-python-wheel-evidence.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          echo "wheel_path=${wheel_path}" >> "$GITHUB_OUTPUT"
+          echo "wheel_name=${wheel_name}" >> "$GITHUB_OUTPUT"
+          echo "wheel_sha256=${wheel_sha256}" >> "$GITHUB_OUTPUT"
+          echo "bundle_name=${bundle_name}" >> "$GITHUB_OUTPUT"
+          echo "bundle_sha256=${bundle_sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload wheel evidence artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: c2pa-python-release-wheel
+          path: |
+            dist/c2pa-python-*-wheel-bundle.tar.gz
+            dist/c2pa-python-*-wheel-bundle.tar.gz.sha256
+            dist/c2pa-python-wheel-evidence.json
+            dist/auditwheel-show.txt
+            dist/import-smoke.txt
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.inputs.outputs.release_tag }}
+          RELEASE_VERSION: ${{ steps.inputs.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          notes_file="dist/release-notes.md"
+          cat > "$notes_file" <<EOF
+          c2pa-python ${RELEASE_VERSION} StardustProof fork wheel.
+
+          Source commit: ${GITHUB_SHA}
+          c2pa-rs submodule: $(git -C c2pa-rs rev-parse HEAD)
+          Wheel SHA-256: ${{ steps.evidence.outputs.wheel_sha256 }}
+          Bundle SHA-256: ${{ steps.evidence.outputs.bundle_sha256 }}
+          GitHub Actions run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              echo "::error::Release tag $RELEASE_TAG points to $tag_commit, not $GITHUB_SHA"
+              exit 1
+            fi
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/c2pa-python-*-wheel-bundle.tar.gz \
+              dist/c2pa-python-*-wheel-bundle.tar.gz.sha256 \
+              dist/c2pa-python-wheel-evidence.json \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/c2pa-python-*-wheel-bundle.tar.gz \
+              dist/c2pa-python-*-wheel-bundle.tar.gz.sha256 \
+              dist/c2pa-python-wheel-evidence.json \
+              --title "$RELEASE_TAG" \
+              --notes-file "$notes_file" \
+              --target "$GITHUB_SHA"
+          fi
