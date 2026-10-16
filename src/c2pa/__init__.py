@@ -32,7 +32,8 @@ from .c2pa import (
     ContextBuilder,
     ContextProvider,
     sdk_version,
-    load_settings
+    load_settings,
+    has_fragment_at_offset
 )  # NOQA
 
 # Re-export C2paError and its subclasses
@@ -51,5 +52,6 @@ __all__ = [
     'ContextBuilder',
     'ContextProvider',
     'sdk_version',
-    'load_settings'
+    'load_settings',
+    'has_fragment_at_offset'
 ]

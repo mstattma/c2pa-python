@@ -168,6 +168,20 @@ else:
 
 _validate_library_exports(_lib)
 
+# Offset-aware single-file fragment verification. Optional, so native
+# libraries that predate it still import; see has_fragment_at_offset().
+_FRAGMENT_AT_OFFSET_FUNCTIONS = (
+    'c2pa_reader_with_fragment_at_offset',
+    'c2pa_reader_fragment_at_offset_supported',
+)
+_FRAGMENT_AT_OFFSET_SYMBOLS_AVAILABLE = all(
+    hasattr(_lib, name) for name in _FRAGMENT_AT_OFFSET_FUNCTIONS
+)
+_FRAGMENT_OFFSET_MAX = 2**64 - 1
+# Cached probe result; None until has_fragment_at_offset() first runs, so
+# importing the module never calls into the native library for it.
+_fragment_at_offset_probe = None
+
 
 class C2paSeekMode(enum.IntEnum):
     """Seek mode for stream operations."""
@@ -1503,6 +1517,16 @@ _setup_function(
      ctypes.POINTER(C2paStream), ctypes.POINTER(C2paStream)],
     ctypes.POINTER(C2paReader)
 )
+if _FRAGMENT_AT_OFFSET_SYMBOLS_AVAILABLE:
+    _setup_function(
+        _lib.c2pa_reader_with_fragment_at_offset,
+        [ctypes.POINTER(C2paReader), ctypes.c_char_p,
+         ctypes.POINTER(C2paStream), ctypes.POINTER(C2paStream),
+         ctypes.c_uint64],
+        ctypes.POINTER(C2paReader)
+    )
+    _setup_function(
+        _lib.c2pa_reader_fragment_at_offset_supported, [], ctypes.c_bool)
 _setup_function(
     _lib.c2pa_builder_from_context,
     [ctypes.POINTER(C2paContext)],
@@ -1939,6 +1963,42 @@ def _to_utf8_bytes(data: Union[str, dict],
         return data.encode('utf-8')
     except UnicodeError as e:
         raise C2paError.Encoding(f"Invalid UTF-8 in {error_context}: {e}")
+
+
+def has_fragment_at_offset() -> bool:
+    """Return whether the native library supports offset-aware fragment
+    verification (:meth:`Reader.with_fragment_at_offset`).
+
+    True only when the library exports both
+    ``c2pa_reader_with_fragment_at_offset`` and
+    ``c2pa_reader_fragment_at_offset_supported`` and the latter reports
+    support. The probe runs on first use, not at import, and is cached.
+    """
+    global _fragment_at_offset_probe
+    if not _FRAGMENT_AT_OFFSET_SYMBOLS_AVAILABLE:
+        return False
+    if _fragment_at_offset_probe is None:
+        _fragment_at_offset_probe = bool(
+            _lib.c2pa_reader_fragment_at_offset_supported())
+    return _fragment_at_offset_probe
+
+
+def _require_fragment_at_offset() -> None:
+    if not has_fragment_at_offset():
+        raise C2paError.NotSupported(
+            "Offset-aware fragment verification is not available in the "
+            "loaded native library (c2pa_reader_with_fragment_at_offset)")
+
+
+def _check_fragment_offset(fragment_offset) -> int:
+    """Validate a fragment offset before any native work."""
+    if isinstance(fragment_offset, bool) or not isinstance(
+            fragment_offset, int):
+        raise TypeError("fragment_offset must be an int")
+    if not 0 <= fragment_offset <= _FRAGMENT_OFFSET_MAX:
+        raise ValueError(
+            f"fragment_offset must be between 0 and {_FRAGMENT_OFFSET_MAX}")
+    return fragment_offset
 
 
 def sdk_version() -> str:
@@ -3402,7 +3462,135 @@ class Reader(ManagedResource):
         this call refused; yield between reads.
         """
         format_arg = _format_ffi_arg(_encode_format(format, "Reader"))
+        return self._swap_in_fragment(
+            format_arg, stream, fragment_stream,
+            lambda handle, main, frag: _lib.c2pa_reader_with_fragment(
+                handle, format_arg, main, frag))
 
+    def with_fragment_at_offset(self, format: Optional[str], stream,
+                                fragment_stream,
+                                fragment_offset: int) -> "Reader":
+        """Process one fragment of a single-file fragmented BMFF asset,
+        verified at its absolute byte offset in that asset.
+
+        A single-file fragmented MP4 hashes its fragments together with their
+        absolute root-box offsets, so a byte-range slice of it (for example an
+        HLS ``EXT-X-BYTERANGE`` segment) only verifies when the verifier knows
+        where the slice sat in the file. ``fragment_offset=0`` behaves like
+        :meth:`with_fragment`.
+
+        With the default exclusions, ``stream`` holds every byte before the
+        first C2PA ``merkle`` uuid box, and ``fragment_stream`` starts at a
+        ``merkle`` uuid box and ends right before the next one (or at the end
+        of the file). A wrong cut or offset does not raise: the reader reports
+        ``assertion.bmffHash.mismatch``. The offset is supplied by the caller;
+        it proves the bytes belong to the Merkle leaf they name, not where
+        they were fetched from.
+
+        Settings and trust come from this reader's Context.
+
+        Args:
+            format: MIME type of the media (e.g., "video/mp4"), handled as
+                in :meth:`with_fragment`.
+            stream: Stream-like object with the initialization bytes.
+            fragment_stream: Stream-like object with the fragment bytes.
+            fragment_offset: Absolute byte offset of the fragment's first
+                byte in the original asset, from 0 to 2**64 - 1.
+
+        Returns:
+            This reader instance, for method chaining.
+
+        Raises:
+            C2paError.NotSupported: If the native library lacks the API
+                (see :func:`has_fragment_at_offset`). The reader is untouched.
+            TypeError, ValueError: For an invalid ``fragment_offset``. The
+                reader is untouched.
+            C2paError: As :meth:`with_fragment`, including the reader being
+                closed after a native failure.
+        """
+        _require_fragment_at_offset()
+        offset = _check_fragment_offset(fragment_offset)
+        format_arg = _format_ffi_arg(_encode_format(format, "Reader"))
+        return self._swap_in_fragment(
+            format_arg, stream, fragment_stream,
+            lambda handle, main, frag: (
+                _lib.c2pa_reader_with_fragment_at_offset(
+                    handle, format_arg, main, frag, offset)))
+
+    @classmethod
+    def from_fragment_at_offset(
+        cls,
+        format: Optional[str],
+        init_stream: Any,
+        fragment_stream: Any,
+        fragment_offset: int,
+        context: Optional['ContextProvider'] = None,
+    ) -> "Reader":
+        """Create a Reader for one fragment of a single-file fragmented
+        BMFF asset, verified at its absolute byte offset.
+
+        Unlike ``Reader(format, init_stream, context=...)`` followed by
+        :meth:`with_fragment_at_offset`, the init stream is not read and
+        validated on its own first. See :meth:`with_fragment_at_offset` for
+        the cut rules and result semantics.
+
+        Args:
+            format: MIME type of the media (e.g., "video/mp4").
+            init_stream: Stream-like object with the initialization bytes.
+            fragment_stream: Stream-like object with the fragment bytes.
+            fragment_offset: Absolute byte offset of the fragment's first
+                byte in the original asset, from 0 to 2**64 - 1.
+            context: Optional ContextProvider supplying settings and trust.
+                When omitted, a default Context is used.
+
+        Raises:
+            C2paError.NotSupported: If the native library lacks the API.
+            TypeError, ValueError: For an invalid argument, before any
+                native object is created.
+            C2paError: If the reader cannot be created or the fragment
+                cannot be processed.
+        """
+        _require_fragment_at_offset()
+        _check_fragment_offset(fragment_offset)
+        if context is not None:
+            if not isinstance(context, ContextProvider):
+                raise TypeError("context must be a ContextProvider")
+            if not context.is_valid:
+                raise C2paError("Context is not valid")
+
+        owned_context = Context() if context is None else None
+        active_context = context if context is not None else owned_context
+        try:
+            reader = object.__new__(cls)
+            ManagedResource.__init__(reader)
+            reader._init_attrs()
+            with _context_guard(active_context):
+                reader._create_and_activate(
+                    lambda: _lib.c2pa_reader_from_context(
+                        active_context.execution_context),
+                    Reader._ERROR_MESSAGES['reader_error'])
+            if context is not None:
+                # Pin a caller-supplied Context for the reader's lifetime.
+                reader._context = context
+            try:
+                reader.with_fragment_at_offset(
+                    format, init_stream, fragment_stream, fragment_offset)
+            except Exception:
+                reader.close()
+                raise
+            return reader
+        finally:
+            # The native reader holds its own reference to the context.
+            if owned_context is not None:
+                owned_context.close()
+
+    def _swap_in_fragment(self, format_arg, stream, fragment_stream,
+                          native_call) -> "Reader":
+        """Run a consuming fragment call and keep its streams.
+
+        ``native_call(handle, main_stream, fragment_stream)`` consumes the
+        reader handle and returns the replacement (NULL on failure).
+        """
         # A forked child cannot wait on a lock no surviving thread will
         # release, so it reports the same error _live_op_lock() does.
         if is_foreign_process(self):
@@ -3429,12 +3617,8 @@ class Reader(ManagedResource):
                     # and a reader must never be served them.
                     self._manifest_json_str_cache = None
                     self._manifest_data_cache = None
-                    return _lib.c2pa_reader_with_fragment(
-                        handle,
-                        format_arg,
-                        main_obj._stream,
-                        frag_obj._stream,
-                    )
+                    return native_call(
+                        handle, main_obj._stream, frag_obj._stream)
 
                 self._consume_and_swap(
                     with_fragment_call,
@@ -4896,5 +5080,6 @@ __all__ = [
     'load_settings',
     'format_embeddable',
     'version',
-    'sdk_version'
+    'sdk_version',
+    'has_fragment_at_offset'
 ]

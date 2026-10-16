@@ -235,6 +235,21 @@ except Exception as err:
     print(err)
 ```
 
+### Verify one fragment of a single-file fragmented MP4
+
+A single-file fragmented MP4 (for example one served as HLS byte ranges) hashes each fragment together with its absolute byte offset in the file. To verify one fragment on its own, pass the bytes before the first C2PA `merkle` box as the init stream, the fragment from its `merkle` box up to the next one, and the fragment's offset in the original file:
+
+```py
+if c2pa.has_fragment_at_offset():
+    with Context() as ctx:
+        with Reader.from_fragment_at_offset(
+                "video/mp4", io.BytesIO(init_bytes), io.BytesIO(fragment_bytes),
+                fragment_offset, context=ctx) as reader:
+            print(reader.get_validation_state())
+```
+
+A wrong cut or offset is reported as `assertion.bmffHash.mismatch` in the validation results rather than raised. An offset of `0` behaves like `Reader.with_fragment()` for fragments stored as separate files. `has_fragment_at_offset()` is `False` when the native library predates this API; the methods then raise `C2paError.NotSupported`.
+
 ### Add a signed manifest to a stream
 
 > [!WARNING]
