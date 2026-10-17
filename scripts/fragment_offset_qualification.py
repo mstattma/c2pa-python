@@ -182,7 +182,7 @@ def qualify():
         raise RuntimeError(f"Expected one downloaded stock library, found {stock}")
     stock = stock[0].resolve()
     shutil.copy2(stock, EVIDENCE / ("stock-" + name))
-    results, reports, problems = {}, {}, []
+    results, reports, regressions = {}, {}, []
     lanes = (("stock", candidate, stock, digest(stock), "0.91.0"),
              ("baseline", baseline, library, native["sha256"], NATIVE_VERSION),
              ("candidate", candidate, library, native["sha256"], NATIVE_VERSION))
@@ -206,20 +206,27 @@ def qualify():
                 raise RuntimeError(f"Process/JUnit status disagreement: {label}")
     for file in SUITES:
         suffix = "-" + file.removesuffix(".py")
-        problems.extend(compare(reports["baseline" + suffix], reports["candidate" + suffix]))
+        regressions.extend(compare(reports["baseline" + suffix], reports["candidate" + suffix]))
+    problems = list(regressions)
     focused = reports["candidate-test_fragment_at_offset"]
-    if len(focused) != 18 or any(v[0] != "passed" for v in focused.values()):
+    focused_pass = len(focused) == 18 and all(v[0] == "passed" for v in focused.values())
+    if not focused_pass:
         problems.append("Focused candidate offsets require exactly 18 passes, no skips")
     # Stock compatibility may skip unsupported native offsets, but no failures.
-    if any(status for label, status in results.items() if label.startswith("stock-")):
+    stock_pass = all(status == 0 for label, status in results.items() if label.startswith("stock-"))
+    if not stock_pass:
         problems.append("Stock 0.91 compatibility failed")
     failures = {label: {key: value for key, value in report.items() if value[0] != "passed"}
                 for label, report in reports.items()}
-    record("comparison.json", {"exit_codes": results, "nonpasses": failures, "regressions": problems})
+    record("comparison.json", {"exit_codes": results, "nonpasses": failures,
+                               "regressions": regressions, "qualification_failures": problems})
     full = all(status == 0 for label, status in results.items() if label.startswith("candidate-"))
     summary = (f"## Fragment offset qualification\n\n"
                f"Candidate full-suite status: **{'PASS' if full else 'FAIL'}**\n\n"
-               f"No-new-regressions + stock + mandatory focused gate: **{'FAIL' if problems else 'PASS'}**\n\n"
+               f"No-new-regressions: **{'FAIL' if regressions else 'PASS'}**\n\n"
+               f"Stock 0.91 compatibility: **{'PASS' if stock_pass else 'FAIL'}**\n\n"
+               f"Mandatory 18 focused offsets (no skips): **{'PASS' if focused_pass else 'FAIL'}**\n\n"
+               f"Combined qualification gate: **{'FAIL' if problems else 'PASS'}**\n\n"
                "Full-suite failures are not waived as full passes. Exact IDs, failure types and "
                "normalized messages (including unchanged baseline failures) are in comparison.json; "
                "raw JUnit, logs and loaded-library evidence are retained.\n\n"

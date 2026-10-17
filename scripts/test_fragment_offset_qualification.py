@@ -97,8 +97,9 @@ class QualificationTests(unittest.TestCase):
                         q.cases(path)
 
     def test_qualification_keeps_full_failure_distinct_and_enforces_gates(self):
-        for changed, skip_offset in ((False, False), (True, False), (False, True)):
-            with self.subTest(changed=changed, skip_offset=skip_offset), tempfile.TemporaryDirectory() as directory:
+        for changed, skip_offset, stock_fail in ((False, False, False), (True, False, False),
+                                                (False, True, False), (False, False, True)):
+            with self.subTest(changed=changed, skip_offset=skip_offset, stock_fail=stock_fail), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 evidence = root / "evidence"
                 evidence.mkdir()
@@ -118,7 +119,7 @@ class QualificationTests(unittest.TestCase):
                     label = args[-1]
                     seen.append((label, args, env))
                     focused = label.endswith("test_fragment_at_offset")
-                    failing = not focused and not label.startswith("stock-")
+                    failing = not focused and (not label.startswith("stock-") or stock_fail)
                     body = ""
                     for index in range(18 if focused else 1):
                         outcome = ""
@@ -134,9 +135,11 @@ class QualificationTests(unittest.TestCase):
                 with patch.object(q, "ROOT", root), patch.object(q, "EVIDENCE", evidence):
                     with patch.object(q, "command", side_effect=fake_command):
                         with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}), patch("builtins.print"):
-                            self.assertEqual(q.qualify(), int(changed or skip_offset))
+                            self.assertEqual(q.qualify(), int(changed or skip_offset or stock_fail))
                 summary = (evidence / "summary.md").read_text(encoding="utf-8")
                 self.assertIn("Candidate full-suite status: **FAIL**", summary)
+                self.assertIn(f"No-new-regressions: **{'FAIL' if changed else 'PASS'}**", summary)
+                self.assertIn(f"Stock 0.91 compatibility: **{'FAIL' if stock_fail else 'PASS'}**", summary)
                 self.assertEqual(len(seen), 8)
                 for label, args, env in seen:
                     if label.startswith("candidate-"):
