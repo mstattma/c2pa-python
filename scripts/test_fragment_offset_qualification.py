@@ -1,5 +1,6 @@
 """Pure stdlib tests: never import c2pa or execute Cargo."""
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,49 @@ class QualificationTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 self.assertTrue(q.compare({"a": failure}, {"a": outcome}))
                 self.assertTrue(q.compare({}, {"new": outcome}))
+
+    def test_windows_fork_applicability_is_exact_and_recorded(self):
+        skipped = ("skipped", "pytest.skip", "requires os.fork")
+        adjustments = []
+        with patch.object(q, "sys", SimpleNamespace(platform="win32")), patch.object(q, "os", SimpleNamespace()):
+            self.assertTrue(q.compare({q.FORK_TEST_ID: q.FORK_BASELINE_FAILURE}, {q.FORK_TEST_ID: skipped}))
+            self.assertEqual(q.compare({q.FORK_TEST_ID: q.FORK_BASELINE_FAILURE},
+                                       {q.FORK_TEST_ID: skipped}, platform_adjustments=adjustments), [])
+        self.assertEqual(adjustments, [{"test_id": q.FORK_TEST_ID, "platform": "win32",
+                                       "baseline": q.FORK_BASELINE_FAILURE, "candidate": skipped}])
+
+    def test_fork_applicability_does_not_relax_other_comparisons(self):
+        skipped = ("skipped", "pytest.skip", "requires os.fork")
+        for platform, os_module, key, previous, outcome in (
+                ("linux", SimpleNamespace(), q.FORK_TEST_ID, q.FORK_BASELINE_FAILURE, skipped),
+                ("win32", SimpleNamespace(fork=object()), q.FORK_TEST_ID, q.FORK_BASELINE_FAILURE, skipped),
+                ("win32", SimpleNamespace(), "other::test", q.FORK_BASELINE_FAILURE, skipped),
+                ("win32", SimpleNamespace(), q.FORK_TEST_ID, ("passed", "", ""), skipped),
+                ("win32", SimpleNamespace(), q.FORK_TEST_ID, ("failure", "builtins.AssertionError", "different failure"), skipped),
+                ("win32", SimpleNamespace(), q.FORK_TEST_ID, q.FORK_BASELINE_FAILURE, ("skipped", "pytest.skip", "other reason")),
+                ("win32", SimpleNamespace(), q.FORK_TEST_ID, q.FORK_BASELINE_FAILURE, ("skipped", "other.type", "requires os.fork"))):
+            with self.subTest(platform=platform, key=key, previous=previous, outcome=outcome):
+                adjustments = []
+                with patch.object(q, "sys", SimpleNamespace(platform=platform)), patch.object(q, "os", os_module):
+                    self.assertTrue(q.compare({key: previous}, {key: outcome}, platform_adjustments=adjustments))
+                self.assertEqual(adjustments, [])
+
+    def test_fork_guard_is_per_test_and_preserves_unix_applicability(self):
+        source = Path(q.__file__).resolve().parents[1] / "tests/test_unit_tests_threaded.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == "TestForkedChildDoesNotDeadlock")
+        self.assertEqual(cls.decorator_list, [])
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "test_parent_copy_unaffected")
+        module = ast.Module(body=[method], type_ignores=[])
+        for supports_fork in (False, True):
+            namespace = {"unittest": unittest, "os": SimpleNamespace(**({"fork": object()} if supports_fork else {}))}
+            exec(compile(module, str(source), "exec"), namespace)
+            function = namespace[method.name]
+            self.assertEqual(getattr(function, "__unittest_skip__", False), not supports_fork)
+            if not supports_fork:
+                self.assertEqual(function.__unittest_skip_why__, "requires os.fork")
 
     def test_normalize_only_paths_and_addresses(self):
         with patch.object(q, "ROOT", Path("/work")):
@@ -137,6 +181,8 @@ class QualificationTests(unittest.TestCase):
                         with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}), patch("builtins.print"):
                             self.assertEqual(q.qualify(), int(changed or skip_offset or stock_fail))
                 summary = (evidence / "summary.md").read_text(encoding="utf-8")
+                comparison = json.loads((evidence / "comparison.json").read_text(encoding="utf-8"))
+                self.assertEqual(comparison["platform_adjustments"], [])
                 self.assertIn("Candidate full-suite status: **FAIL**", summary)
                 self.assertIn(f"No-new-regressions: **{'FAIL' if changed else 'PASS'}**", summary)
                 self.assertIn(f"Stock 0.91 compatibility: **{'FAIL' if stock_fail else 'PASS'}**", summary)

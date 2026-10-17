@@ -19,6 +19,13 @@ NATIVE_VERSION = "0.92.0-dev"
 FEATURES = "rust_native_crypto,add_thumbnails,http,file_io"
 RUST = "1.96.0"
 SUITES = ("test_unit_tests.py", "test_unit_tests_threaded.py")
+FORK_TEST_ID = "tests.test_unit_tests_threaded.TestForkedChildDoesNotDeadlock::test_parent_copy_unaffected"
+FORK_BASELINE_FAILURE = (
+    "failure", "builtins.AssertionError",
+    'AssertionError: 1 != 0 : Traceback (most recent call last):\n'
+    '  File "<string>", line 11, in <module>\n'
+    "AttributeError: module 'os' has no attribute 'fork'",
+)
 ROOT = Path(__file__).resolve().parents[2]
 EVIDENCE = ROOT / "evidence"
 
@@ -158,10 +165,19 @@ def cases(path):
     return result
 
 
-def compare(baseline, candidate):
+def compare(baseline, candidate, *, platform_adjustments=None):
     problems = [f"Missing common test: {key}" for key in baseline.keys() - candidate.keys()]
     for key, outcome in candidate.items():
         previous = baseline.get(key, ("passed", "", ""))
+        # The base predates the fork guard. Exempt only its exact Windows
+        # missing-fork failure, never a passing test or an unrelated failure.
+        if (platform_adjustments is not None and sys.platform == "win32"
+                and not hasattr(os, "fork") and key == FORK_TEST_ID
+                and previous == FORK_BASELINE_FAILURE
+                and outcome == ("skipped", "pytest.skip", "requires os.fork")):
+            platform_adjustments.append({"test_id": key, "platform": sys.platform,
+                                         "baseline": previous, "candidate": outcome})
+            continue
         if outcome[0] != "passed" and outcome != previous:
             problems.append(f"New/changed outcome: {key}: {outcome!r}; baseline: {previous!r}")
     return sorted(problems)
@@ -182,7 +198,7 @@ def qualify():
         raise RuntimeError(f"Expected one downloaded stock library, found {stock}")
     stock = stock[0].resolve()
     shutil.copy2(stock, EVIDENCE / ("stock-" + name))
-    results, reports, regressions = {}, {}, []
+    results, reports, regressions, platform_adjustments = {}, {}, [], []
     lanes = (("stock", candidate, stock, digest(stock), "0.91.0"),
              ("baseline", baseline, library, native["sha256"], NATIVE_VERSION),
              ("candidate", candidate, library, native["sha256"], NATIVE_VERSION))
@@ -206,7 +222,8 @@ def qualify():
                 raise RuntimeError(f"Process/JUnit status disagreement: {label}")
     for file in SUITES:
         suffix = "-" + file.removesuffix(".py")
-        regressions.extend(compare(reports["baseline" + suffix], reports["candidate" + suffix]))
+        regressions.extend(compare(reports["baseline" + suffix], reports["candidate" + suffix],
+                                   platform_adjustments=platform_adjustments))
     problems = list(regressions)
     focused = reports["candidate-test_fragment_at_offset"]
     focused_pass = len(focused) == 18 and all(v[0] == "passed" for v in focused.values())
@@ -219,7 +236,8 @@ def qualify():
     failures = {label: {key: value for key, value in report.items() if value[0] != "passed"}
                 for label, report in reports.items()}
     record("comparison.json", {"exit_codes": results, "nonpasses": failures,
-                               "regressions": regressions, "qualification_failures": problems})
+                               "regressions": regressions, "qualification_failures": problems,
+                               "platform_adjustments": platform_adjustments})
     full = all(status == 0 for label, status in results.items() if label.startswith("candidate-"))
     summary = (f"## Fragment offset qualification\n\n"
                f"Candidate full-suite status: **{'PASS' if full else 'FAIL'}**\n\n"
@@ -227,13 +245,17 @@ def qualify():
                f"Stock 0.91 compatibility: **{'PASS' if stock_pass else 'FAIL'}**\n\n"
                f"Mandatory 18 focused offsets (no skips): **{'PASS' if focused_pass else 'FAIL'}**\n\n"
                f"Combined qualification gate: **{'FAIL' if problems else 'PASS'}**\n\n"
+               f"Explicit platform applicability adjustments: **{len(platform_adjustments)}**\n\n"
                "Full-suite failures are not waived as full passes. Exact IDs, failure types and "
                "normalized messages (including unchanged baseline failures) are in comparison.json; "
                "raw JUnit, logs and loaded-library evidence are retained.\n\n"
                + "\n".join(f"- {label}: exit {status}" for label, status in results.items()) + "\n\n"
                + "\n".join(f"- `{label} / {key}`: {value!r}"
                            for label, report in failures.items() for key, value in report.items()
-                           if value[0] != "skipped") + "\n")
+                           if value[0] != "skipped") + "\n"
+               + "\n".join(f"- Platform applicability: `{entry['test_id']}` on {entry['platform']}: "
+                           f"{entry['baseline']!r} -> {entry['candidate']!r}"
+                           for entry in platform_adjustments) + "\n")
     (EVIDENCE / "summary.md").write_text(summary, encoding="utf-8")
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as file:
         file.write(summary)
