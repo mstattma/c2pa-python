@@ -32,6 +32,7 @@ import io
 import json
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import c2pa
@@ -97,7 +98,7 @@ class TestFragmentAtOffsetFeatureDetection(unittest.TestCase):
 
 
 class TestFragmentAtOffsetValidation(unittest.TestCase):
-    """Invalid offsets are refused before any native call."""
+    """Invalid arguments are refused before any native allocation or mutation."""
 
     def setUp(self):
         self.patch = patch.object(
@@ -115,6 +116,45 @@ class TestFragmentAtOffsetValidation(unittest.TestCase):
     def assert_untouched(self):
         self.assertTrue(self.reader.is_valid)
         self.assertEqual(self.reader.json(), self.before)
+
+    def assert_invalid_inputs(self, error, format, init, fragment):
+        handle = self.reader._handle
+        streams = (self.reader._own_stream, self.reader._fragment_streams)
+        with patch.object(c2pa_module, "_lib") as lib:
+            with self.assertRaises(error):
+                Reader.from_fragment_at_offset(format, init, fragment, 0)
+            with self.assertRaises(error):
+                self.reader.with_fragment_at_offset(format, init, fragment, 0)
+            # Includes Context, Reader, and Stream allocation entry points.
+            self.assertEqual(lib.mock_calls, [])
+        self.assertIs(self.reader._handle, handle)
+        self.assertIs(self.reader._own_stream, streams[0])
+        self.assertIs(self.reader._fragment_streams, streams[1])
+        self.assert_untouched()
+
+    def test_rejects_invalid_streams_before_allocation(self):
+        for invalid in (None, "init.mp4", Path("init.mp4"), b"init", object()):
+            for position in (0, 1):
+                with self.subTest(invalid=invalid, position=position):
+                    streams = [io.BytesIO(b"i"), io.BytesIO(b"f")]
+                    streams[position] = invalid
+                    self.assert_invalid_inputs(TypeError, "video/mp4", *streams)
+
+    def test_rejects_aliased_streams_before_allocation(self):
+        stream = io.BytesIO(b"i")
+        self.assert_invalid_inputs(ValueError, "video/mp4", stream, stream)
+
+    def test_rejects_invalid_format_types_before_allocation(self):
+        for format in (False, 0, 1, b"video/mp4", [], {}, object()):
+            with self.subTest(format=format):
+                self.assert_invalid_inputs(
+                    TypeError, format, io.BytesIO(b"i"), io.BytesIO(b"f"))
+
+    def test_rejects_invalid_format_encoding_before_allocation(self):
+        for format in ("video/mp4\x00", "\x00video/mp4", "video/\ud800"):
+            with self.subTest(format=format):
+                self.assert_invalid_inputs(
+                    Error, format, io.BytesIO(b"i"), io.BytesIO(b"f"))
 
     def test_rejects_non_int_offsets(self):
         for offset in (True, False, 1.0, "1", None, b"\x01"):

@@ -2945,6 +2945,22 @@ def _encode_format(
             f"Invalid UTF-8 characters in input: {e}")
 
 
+def _fragment_offset_format_arg(
+    format: Optional[str], stream: Any, fragment_stream: Any,
+) -> bytes:
+    """Validate offset-aware fragment inputs before allocating native objects."""
+    if format is not None and not isinstance(format, str):
+        raise TypeError("format must be a str or None")
+    format_arg = _format_ffi_arg(_encode_format(format, "Reader"))
+    _check_cstr_arg('format', format_arg)
+    for name, value in (("stream", stream), ("fragment_stream", fragment_stream)):
+        if not Stream.is_read_stream(value):
+            raise TypeError(f"{name} must be a stream-like object")
+    if stream is fragment_stream:
+        raise ValueError("stream and fragment_stream must be distinct objects")
+    return format_arg
+
+
 def _format_ffi_arg(fmt: Optional[bytes]) -> bytes:
     """Convert an encoded format to the native FFI argument.
 
@@ -3482,10 +3498,12 @@ class Reader(ManagedResource):
         With the default exclusions, ``stream`` holds every byte before the
         first C2PA ``merkle`` uuid box, and ``fragment_stream`` starts at a
         ``merkle`` uuid box and ends right before the next one (or at the end
-        of the file). A wrong cut or offset does not raise: the reader reports
-        ``assertion.bmffHash.mismatch``. The offset is supplied by the caller;
-        it proves the bytes belong to the Merkle leaf they name, not where
-        they were fetched from.
+        of the file). With a valid init and a parseable fragment, hash failures
+        caused by a wrong cut or offset are reported as
+        ``assertion.bmffHash.mismatch`` rather than raising. Init-loading or
+        fragment-parsing errors raise ``C2paError``. The offset is supplied by
+        the caller; it proves the bytes belong to the Merkle leaf they name,
+        not where they were fetched from.
 
         Settings and trust come from this reader's Context.
 
@@ -3503,14 +3521,16 @@ class Reader(ManagedResource):
         Raises:
             C2paError.NotSupported: If the native library lacks the API
                 (see :func:`has_fragment_at_offset`). The reader is untouched.
-            TypeError, ValueError: For an invalid ``fragment_offset``. The
+            TypeError, ValueError: For an invalid offset, format type, or
+                streams. The reader is untouched.
+            C2paError: For a NUL byte or invalid UTF-8 in the format. The
                 reader is untouched.
             C2paError: As :meth:`with_fragment`, including the reader being
                 closed after a native failure.
         """
         _require_fragment_at_offset()
         offset = _check_fragment_offset(fragment_offset)
-        format_arg = _format_ffi_arg(_encode_format(format, "Reader"))
+        format_arg = _fragment_offset_format_arg(format, stream, fragment_stream)
         return self._swap_in_fragment(
             format_arg, stream, fragment_stream,
             lambda handle, main, frag: (
@@ -3545,13 +3565,16 @@ class Reader(ManagedResource):
 
         Raises:
             C2paError.NotSupported: If the native library lacks the API.
-            TypeError, ValueError: For an invalid argument, before any
-                native object is created.
+            TypeError, ValueError: For an invalid offset, format type,
+                streams, or context type, before any native object is created.
+            C2paError: For a NUL byte or invalid UTF-8 in the format, or an
+                invalid context, before any native object is created.
             C2paError: If the reader cannot be created or the fragment
                 cannot be processed.
         """
         _require_fragment_at_offset()
         _check_fragment_offset(fragment_offset)
+        _fragment_offset_format_arg(format, init_stream, fragment_stream)
         if context is not None:
             if not isinstance(context, ContextProvider):
                 raise TypeError("context must be a ContextProvider")
