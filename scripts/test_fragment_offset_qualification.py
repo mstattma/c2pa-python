@@ -9,6 +9,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 import fragment_offset_qualification as q
 
@@ -37,9 +38,9 @@ class QualificationTests(unittest.TestCase):
         with patch.object(q, "sys", SimpleNamespace(platform="win32")), patch.object(q, "os", SimpleNamespace()):
             self.assertTrue(q.compare({q.FORK_TEST_ID: q.FORK_BASELINE_FAILURE}, {q.FORK_TEST_ID: skipped}))
             self.assertEqual(q.compare({q.FORK_TEST_ID: q.FORK_BASELINE_FAILURE},
-                                       {q.FORK_TEST_ID: skipped}, platform_adjustments=adjustments), [])
+                                       {q.FORK_TEST_ID: skipped}, platform_adjustments=adjustments, context="native"), [])
         self.assertEqual(adjustments, [{"test_id": q.FORK_TEST_ID, "platform": "win32",
-                                       "baseline": q.FORK_BASELINE_FAILURE, "candidate": skipped}])
+                                       "context": "native", "baseline": q.FORK_BASELINE_FAILURE, "candidate": skipped}])
 
     def test_fork_applicability_does_not_relax_other_comparisons(self):
         skipped = ("skipped", "pytest.skip", "requires os.fork")
@@ -54,8 +55,56 @@ class QualificationTests(unittest.TestCase):
             with self.subTest(platform=platform, key=key, previous=previous, outcome=outcome):
                 adjustments = []
                 with patch.object(q, "sys", SimpleNamespace(platform=platform)), patch.object(q, "os", os_module):
-                    self.assertTrue(q.compare({key: previous}, {key: outcome}, platform_adjustments=adjustments))
+                    self.assertTrue(q.compare({key: previous}, {key: outcome}, platform_adjustments=adjustments, context="native"))
                 self.assertEqual(adjustments, [])
+
+    def test_required_focused_ids_match_source_without_native_imports(self):
+        source = Path(q.__file__).resolve().parents[1] / "tests/test_fragment_at_offset.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        ids = {f"tests.test_fragment_at_offset.{cls.name}::{method.name}"
+               for cls in tree.body if isinstance(cls, ast.ClassDef)
+               for method in cls.body if isinstance(method, ast.FunctionDef) and method.name.startswith("test_")}
+        self.assertEqual(len(q.REQUIRED_OFFSET_TEST_IDS), 18)
+        self.assertEqual(len(q.BINDING_OFFSET_TEST_IDS), 11)
+        self.assertEqual(len(q.NATIVE_OFFSET_TEST_IDS), 7)
+        self.assertLessEqual(q.REQUIRED_OFFSET_TEST_IDS, ids)
+
+    def test_focused_required_ids_cannot_be_replaced_at_constant_count(self):
+        report = dict.fromkeys(q.REQUIRED_OFFSET_TEST_IDS, ("passed", "", ""))
+        removed = sorted(q.REQUIRED_OFFSET_TEST_IDS)[0]
+        del report[removed]
+        report["unrelated.T::test_other"] = ("passed", "", "")
+        self.assertEqual(len(report), 18)
+        self.assertEqual(q.focused_problems(report), [f"Missing required focused test: {removed}"])
+
+    def test_focused_allows_extra_passes_but_no_extra_failure_or_skip(self):
+        report = dict.fromkeys(q.REQUIRED_OFFSET_TEST_IDS, ("passed", "", ""))
+        self.assertEqual(q.focused_problems(report), [])
+        report["future.T::test_extra"] = ("passed", "", "")
+        self.assertEqual(q.focused_problems(report), [])
+        for key in (sorted(q.REQUIRED_OFFSET_TEST_IDS)[0], "future.T::test_extra"):
+            for outcome in (("failure", "AssertionError", "bad"), ("skipped", "pytest.skip", "unsupported")):
+                with self.subTest(key=key, outcome=outcome):
+                    self.assertTrue(q.focused_problems({**report, key: outcome}))
+
+    def test_stock_focused_requires_binding_passes_and_exact_native_skips(self):
+        report = dict.fromkeys(q.BINDING_OFFSET_TEST_IDS, ("passed", "", ""))
+        report.update(dict.fromkeys(q.NATIVE_OFFSET_TEST_IDS, q.STOCK_NATIVE_SKIP))
+        self.assertEqual(q.focused_problems(report, stock=True), [])
+        self.assertEqual(q.focused_problems({**report, "future.T::test_extra": ("passed", "", "")}, stock=True), [])
+        native_id = sorted(q.NATIVE_OFFSET_TEST_IDS)[0]
+        binding_id = sorted(q.BINDING_OFFSET_TEST_IDS)[0]
+        for key, outcome in ((binding_id, q.STOCK_NATIVE_SKIP),
+                             (native_id, ("skipped", "pytest.skip", "wrong reason")),
+                             (native_id, ("skipped", "other.type", q.STOCK_NATIVE_SKIP[2])),
+                             (native_id, ("passed", "", "")),
+                             ("future.T::test_extra", q.STOCK_NATIVE_SKIP)):
+            with self.subTest(key=key, outcome=outcome):
+                self.assertTrue(q.focused_problems({**report, key: outcome}, stock=True))
+        del report[native_id]
+        report["unrelated.T::test_other"] = ("passed", "", "")
+        self.assertEqual(len(report), 18)
+        self.assertTrue(q.focused_problems(report, stock=True))
 
     def test_fork_guard_is_per_test_and_preserves_unix_applicability(self):
         source = Path(q.__file__).resolve().parents[1] / "tests/test_unit_tests_threaded.py"
@@ -141,9 +190,10 @@ class QualificationTests(unittest.TestCase):
                         q.cases(path)
 
     def test_qualification_keeps_full_failure_distinct_and_enforces_gates(self):
-        for changed, skip_offset, stock_fail in ((False, False, False), (True, False, False),
-                                                (False, True, False), (False, False, True)):
-            with self.subTest(changed=changed, skip_offset=skip_offset, stock_fail=stock_fail), tempfile.TemporaryDirectory() as directory:
+        for scenario in ("unchanged", "native-failure", "native-offset-skip", "stock-failure", "stock-new-skip", "stock-missing-common",
+                         "replace-required-id", "stock-binding-skip", "stock-native-wrong-reason",
+                         "stock-baseline-unexpected-failure", "windows-fork"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 evidence = root / "evidence"
                 evidence.mkdir()
@@ -163,37 +213,85 @@ class QualificationTests(unittest.TestCase):
                     label = args[-1]
                     seen.append((label, args, env))
                     focused = label.endswith("test_fragment_at_offset")
-                    failing = not focused and (not label.startswith("stock-") or stock_fail)
-                    body = ""
-                    for index in range(18 if focused else 1):
-                        outcome = ""
-                        if failing:
-                            message = "changed" if changed and label.startswith("candidate-") else "baseline failure"
-                            outcome = f'<failure type="AssertionError" message="{message}"/>'
-                        if skip_offset and label == "candidate-test_fragment_at_offset" and index == 0:
-                            outcome = '<skipped message="unsupported"/>'
-                        body += f'<testcase classname="T" name="test_{index}">{outcome}</testcase>'
-                    (evidence / (label + ".xml")).write_text(f"<testsuite>{body}</testsuite>", encoding="utf-8")
-                    return int(failing)
+                    if focused:
+                        report = dict.fromkeys(q.REQUIRED_OFFSET_TEST_IDS, ("passed", "", ""))
+                        if label.startswith("stock-"):
+                            report.update(dict.fromkeys(q.NATIVE_OFFSET_TEST_IDS, q.STOCK_NATIVE_SKIP))
+                        native_id = sorted(q.NATIVE_OFFSET_TEST_IDS)[0]
+                        if scenario == "native-offset-skip" and label.startswith("candidate-"):
+                            report[native_id] = q.STOCK_NATIVE_SKIP
+                        if scenario == "replace-required-id" and label.startswith("candidate-"):
+                            del report[native_id]
+                            report["unrelated.T::test_extra"] = ("passed", "", "")
+                            self.assertEqual(len(report), 18)
+                        if scenario == "stock-binding-skip" and label.startswith("stock-"):
+                            report[sorted(q.BINDING_OFFSET_TEST_IDS)[0]] = q.STOCK_NATIVE_SKIP
+                        if scenario == "stock-native-wrong-reason" and label.startswith("stock-"):
+                            report[native_id] = ("skipped", "pytest.skip", "wrong reason")
+                    else:
+                        report = {"T::test_common": ("passed", "", "")}
+                        if label.startswith(("baseline-", "candidate-")):
+                            message = "changed" if scenario == "native-failure" and label.startswith("candidate-") else "baseline failure"
+                            report["T::test_common"] = ("failure", "AssertionError", message)
+                        if label == "stock-test_unit_tests":
+                            if scenario == "stock-failure":
+                                report["T::test_common"] = ("failure", "AssertionError", "stock failure")
+                            if scenario == "stock-new-skip":
+                                report["T::test_common"] = ("skipped", "pytest.skip", "hidden regression")
+                            if scenario == "stock-missing-common":
+                                report = {"T::test_unrelated": ("passed", "", "")}
+                        if scenario == "stock-baseline-unexpected-failure" and label == "stock-baseline-test_unit_tests":
+                            report["T::test_common"] = ("failure", "AssertionError", "unexpected baseline failure")
+                        if scenario == "windows-fork" and label.endswith("test_unit_tests_threaded"):
+                            report[q.FORK_TEST_ID] = (q.FORK_BASELINE_FAILURE if label.startswith(("baseline-", "stock-baseline-"))
+                                                      else ("skipped", "pytest.skip", "requires os.fork"))
+                    xml = ET.Element("testsuite")
+                    for key, (kind, failure_type, message) in report.items():
+                        classname, name = key.split("::", 1)
+                        case = ET.SubElement(xml, "testcase", classname=classname, name=name)
+                        if kind != "passed":
+                            ET.SubElement(case, kind, type=failure_type, message=message)
+                    ET.ElementTree(xml).write(evidence / (label + ".xml"), encoding="utf-8")
+                    return int(any(outcome[0] in ("failure", "error") for outcome in report.values()))
 
                 with patch.object(q, "ROOT", root), patch.object(q, "EVIDENCE", evidence):
                     with patch.object(q, "command", side_effect=fake_command):
                         with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}), patch("builtins.print"):
-                            self.assertEqual(q.qualify(), int(changed or skip_offset or stock_fail))
+                            sys_module = SimpleNamespace(platform="win32" if scenario == "windows-fork" else "linux", executable=q.sys.executable)
+                            with patch.object(q, "sys", sys_module), patch.object(q, "os", SimpleNamespace(environ=os.environ)):
+                                self.assertEqual(q.qualify(), int(scenario not in ("unchanged", "windows-fork")))
                 summary = (evidence / "summary.md").read_text(encoding="utf-8")
                 comparison = json.loads((evidence / "comparison.json").read_text(encoding="utf-8"))
-                self.assertEqual(comparison["platform_adjustments"], [])
+                if scenario == "windows-fork":
+                    self.assertEqual({entry["context"] for entry in comparison["platform_adjustments"]}, {"stock", "native"})
+                    self.assertEqual(len(comparison["platform_adjustments"]), 2)
+                    self.assertEqual(comparison["exit_codes"]["stock-baseline-test_unit_tests_threaded"], 1)
+                    self.assertEqual(comparison["exit_codes"]["stock-test_unit_tests_threaded"], 0)
+                else:
+                    self.assertEqual(comparison["platform_adjustments"], [])
+                if scenario in ("stock-new-skip", "stock-missing-common"):
+                    self.assertEqual(comparison["exit_codes"]["stock-test_unit_tests"], 0)
+                    self.assertTrue(comparison["comparisons"]["stock"])
                 self.assertIn("Candidate full-suite status: **FAIL**", summary)
-                self.assertIn(f"No-new-regressions: **{'FAIL' if changed else 'PASS'}**", summary)
-                self.assertIn(f"Stock 0.91 compatibility: **{'FAIL' if stock_fail else 'PASS'}**", summary)
-                self.assertEqual(len(seen), 8)
+                self.assertIn(f"No-new-regressions: **{'FAIL' if scenario in ('native-failure', 'stock-failure', 'stock-new-skip', 'stock-missing-common') else 'PASS'}**", summary)
+                self.assertIn(f"Stock 0.91 compatibility: **{'FAIL' if scenario.startswith('stock-') else 'PASS'}**", summary)
+                self.assertEqual(len(seen), 10)
+                self.assertEqual(set(comparison["lanes"]), {"stock-baseline", "stock", "baseline", "candidate"})
                 for label, args, env in seen:
                     if label.startswith("candidate-"):
                         self.assertEqual(env["C2PA_FRAGMENT_OFFSET_REQUIRED"], "1")
-                    if not label.startswith("stock-"):
+                    if label.startswith("stock-"):
+                        self.assertNotIn("C2PA_PREFLIGHT_RUN", env)
+                        self.assertNotIn("C2PA_FRAGMENT_OFFSET_REQUIRED", env)
+                        self.assertEqual(env["C2PA_LIBRARY_NAME"], str(stock))
+                        self.assertEqual(args[5], q.digest(stock))
+                    else:
                         self.assertEqual(env["C2PA_PREFLIGHT_RUN"], "1")
                         self.assertEqual(env["C2PA_LIBRARY_NAME"], str(native))
                         self.assertEqual(args[5], q.digest(native))
+                    source = root / ("baseline" if label.startswith(("stock-baseline-", "baseline-")) else "candidate")
+                    self.assertEqual(args[3], str(source))
+                    self.assertEqual(env["PYTHONPATH"], str(source / "src"))
 
     def test_loaded_provenance_rejects_fallback_without_native_imports(self):
         fake = SimpleNamespace(_lib=SimpleNamespace(_name="relative-fallback.so"))

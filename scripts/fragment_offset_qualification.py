@@ -19,6 +19,31 @@ NATIVE_VERSION = "0.92.0-dev"
 FEATURES = "rust_native_crypto,add_thumbnails,http,file_io"
 RUST = "1.96.0"
 SUITES = ("test_unit_tests.py", "test_unit_tests_threaded.py")
+# Reviewed raw JUnit keys: future passing tests may extend, not replace, these IDs.
+BINDING_OFFSET_TEST_IDS = frozenset({
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetFeatureDetection::test_exported_from_package",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetFeatureDetection::test_false_without_symbols",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetFeatureDetection::test_probe_result_is_used_and_cached",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetFeatureDetection::test_unsupported_raises_before_touching_the_reader",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetValidation::test_from_rejects_invalid_context",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetValidation::test_rejects_aliased_streams_before_allocation",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetValidation::test_rejects_invalid_format_encoding_before_allocation",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetValidation::test_rejects_invalid_format_types_before_allocation",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetValidation::test_rejects_invalid_streams_before_allocation",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetValidation::test_rejects_non_int_offsets",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetValidation::test_rejects_out_of_range_offsets",
+})
+NATIVE_OFFSET_TEST_IDS = frozenset({
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetNative::test_from_fails_cleanly_without_a_manifest",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetNative::test_from_fragment_at_offset_zero",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetNative::test_maximum_offset_never_verifies",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetNative::test_native_failure_closes_the_reader",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetNative::test_replacing_the_fragment_refreshes_results",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetNative::test_wrong_offset_is_a_mismatch_not_an_error",
+    "tests.test_fragment_at_offset.TestFragmentAtOffsetNative::test_zero_offset_matches_with_fragment",
+})
+REQUIRED_OFFSET_TEST_IDS = BINDING_OFFSET_TEST_IDS | NATIVE_OFFSET_TEST_IDS
+STOCK_NATIVE_SKIP = ("skipped", "pytest.skip", "native library lacks c2pa_reader_with_fragment_at_offset")
 FORK_TEST_ID = "tests.test_unit_tests_threaded.TestForkedChildDoesNotDeadlock::test_parent_copy_unaffected"
 FORK_BASELINE_FAILURE = (
     "failure", "builtins.AssertionError",
@@ -165,17 +190,26 @@ def cases(path):
     return result
 
 
-def compare(baseline, candidate, *, platform_adjustments=None):
+def focused_problems(report, *, stock=False):
+    problems = [f"Missing required focused test: {key}" for key in REQUIRED_OFFSET_TEST_IDS - report.keys()]
+    for key, outcome in report.items():
+        expected = STOCK_NATIVE_SKIP if stock and key in NATIVE_OFFSET_TEST_IDS else ("passed", "", "")
+        if outcome != expected:
+            problems.append(f"Unexpected focused outcome: {key}: {outcome!r}; expected: {expected!r}")
+    return sorted(problems)
+
+
+def compare(baseline, candidate, *, platform_adjustments=None, context=None):
     problems = [f"Missing common test: {key}" for key in baseline.keys() - candidate.keys()]
     for key, outcome in candidate.items():
         previous = baseline.get(key, ("passed", "", ""))
         # The base predates the fork guard. Exempt only its exact Windows
         # missing-fork failure, never a passing test or an unrelated failure.
-        if (platform_adjustments is not None and sys.platform == "win32"
+        if (platform_adjustments is not None and context in ("stock", "native") and sys.platform == "win32"
                 and not hasattr(os, "fork") and key == FORK_TEST_ID
                 and previous == FORK_BASELINE_FAILURE
                 and outcome == ("skipped", "pytest.skip", "requires os.fork")):
-            platform_adjustments.append({"test_id": key, "platform": sys.platform,
+            platform_adjustments.append({"test_id": key, "platform": sys.platform, "context": context,
                                          "baseline": previous, "candidate": outcome})
             continue
         if outcome[0] != "passed" and outcome != previous:
@@ -199,18 +233,19 @@ def qualify():
     stock = stock[0].resolve()
     shutil.copy2(stock, EVIDENCE / ("stock-" + name))
     results, reports, regressions, platform_adjustments = {}, {}, [], []
-    lanes = (("stock", candidate, stock, digest(stock), "0.91.0"),
+    lanes = (("stock-baseline", baseline, stock, digest(stock), "0.91.0"),
+             ("stock", candidate, stock, digest(stock), "0.91.0"),
              ("baseline", baseline, library, native["sha256"], NATIVE_VERSION),
              ("candidate", candidate, library, native["sha256"], NATIVE_VERSION))
     for lane, source, binary, sha, version in lanes:
-        files = SUITES + (("test_fragment_at_offset.py",) if lane != "baseline" else ())
+        files = SUITES + (("test_fragment_at_offset.py",) if lane in ("stock", "candidate") else ())
         for test_file in files:
             label = lane + "-" + test_file.removesuffix(".py")
             env = dict(os.environ, PYTHONPATH=str(source / "src"),
                        C2PA_LIBRARY_NAME=str(binary), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
             env.pop("C2PA_PREFLIGHT_RUN", None)
             env.pop("C2PA_FRAGMENT_OFFSET_REQUIRED", None)
-            if lane != "stock":
+            if lane in ("baseline", "candidate"):
                 env["C2PA_PREFLIGHT_RUN"] = "1"
             if lane == "candidate":
                 env["C2PA_FRAGMENT_OFFSET_REQUIRED"] = "1"
@@ -220,30 +255,53 @@ def qualify():
             reports[label] = cases(EVIDENCE / (label + ".xml"))
             if (results[label] == 0) != all(v[0] in ("passed", "skipped") for v in reports[label].values()):
                 raise RuntimeError(f"Process/JUnit status disagreement: {label}")
-    for file in SUITES:
-        suffix = "-" + file.removesuffix(".py")
-        regressions.extend(compare(reports["baseline" + suffix], reports["candidate" + suffix],
-                                   platform_adjustments=platform_adjustments))
+    comparisons = {}
+    for context, base_lane, pr_lane in (("stock", "stock-baseline", "stock"), ("native", "baseline", "candidate")):
+        comparisons[context] = []
+        for file in SUITES:
+            suffix = "-" + file.removesuffix(".py")
+            comparisons[context].extend(compare(reports[base_lane + suffix], reports[pr_lane + suffix],
+                                                platform_adjustments=platform_adjustments, context=context))
+        regressions.extend(f"{context}: {problem}" for problem in comparisons[context])
     problems = list(regressions)
-    focused = reports["candidate-test_fragment_at_offset"]
-    focused_pass = len(focused) == 18 and all(v[0] == "passed" for v in focused.values())
-    if not focused_pass:
-        problems.append("Focused candidate offsets require exactly 18 passes, no skips")
-    # Stock compatibility may skip unsupported native offsets, but no failures.
-    stock_pass = all(status == 0 for label, status in results.items() if label.startswith("stock-"))
+    focused = {lane: focused_problems(reports[lane + "-test_fragment_at_offset"], stock=lane == "stock")
+               for lane in ("stock", "candidate")}
+    focused_pass = not focused["candidate"]
+    problems.extend(f"{lane} focused: {problem}" for lane, issues in focused.items() for problem in issues)
+    # The unmodified stock base may fail only the explicitly recognized fork case.
+    allowed_base_failures = {entry["test_id"]: entry["baseline"] for entry in platform_adjustments
+                             if entry["context"] == "stock"}
+    stock_base_problems = []
+    for file in SUITES:
+        label = "stock-baseline-" + file.removesuffix(".py")
+        stock_base_problems.extend(f"Unexpected stock baseline failure: {key}: {outcome!r}"
+                                   for key, outcome in reports[label].items()
+                                   if outcome[0] in ("failure", "error") and allowed_base_failures.get(key) != outcome)
+    problems.extend(stock_base_problems)
+    stock_labels = ["stock-" + file.removesuffix(".py") for file in (*SUITES, "test_fragment_at_offset.py")]
+    stock_pass = (all(results[label] == 0 for label in stock_labels)
+                  and not comparisons["stock"] and not focused["stock"] and not stock_base_problems)
     if not stock_pass:
         problems.append("Stock 0.91 compatibility failed")
     failures = {label: {key: value for key, value in report.items() if value[0] != "passed"}
                 for label, report in reports.items()}
     record("comparison.json", {"exit_codes": results, "nonpasses": failures,
                                "regressions": regressions, "qualification_failures": problems,
+                               "comparisons": comparisons, "focused_problems": focused,
+                               "focused_requirements": {"required_ids": sorted(REQUIRED_OFFSET_TEST_IDS),
+                                                        "stock_native_skip_ids": sorted(NATIVE_OFFSET_TEST_IDS),
+                                                        "stock_native_skip": STOCK_NATIVE_SKIP},
+                               "lanes": {lane: {"python_source": str(source), "library": str(binary),
+                                                "sha256": sha, "version": version}
+                                         for lane, source, binary, sha, version in lanes},
                                "platform_adjustments": platform_adjustments})
     full = all(status == 0 for label, status in results.items() if label.startswith("candidate-"))
     summary = (f"## Fragment offset qualification\n\n"
                f"Candidate full-suite status: **{'PASS' if full else 'FAIL'}**\n\n"
                f"No-new-regressions: **{'FAIL' if regressions else 'PASS'}**\n\n"
                f"Stock 0.91 compatibility: **{'PASS' if stock_pass else 'FAIL'}**\n\n"
-               f"Mandatory 18 focused offsets (no skips): **{'PASS' if focused_pass else 'FAIL'}**\n\n"
+               f"Required 18 focused offset IDs (all pass, no skips): **{'PASS' if focused_pass else 'FAIL'}**\n\n"
+               f"Stock focused IDs (11 pass, 7 exact unsupported skips): **{'FAIL' if focused['stock'] else 'PASS'}**\n\n"
                f"Combined qualification gate: **{'FAIL' if problems else 'PASS'}**\n\n"
                f"Explicit platform applicability adjustments: **{len(platform_adjustments)}**\n\n"
                "Full-suite failures are not waived as full passes. Exact IDs, failure types and "
@@ -253,7 +311,7 @@ def qualify():
                + "\n".join(f"- `{label} / {key}`: {value!r}"
                            for label, report in failures.items() for key, value in report.items()
                            if value[0] != "skipped") + "\n"
-               + "\n".join(f"- Platform applicability: `{entry['test_id']}` on {entry['platform']}: "
+               + "\n".join(f"- Platform applicability ({entry['context']}): `{entry['test_id']}` on {entry['platform']}: "
                            f"{entry['baseline']!r} -> {entry['candidate']!r}"
                            for entry in platform_adjustments) + "\n")
     (EVIDENCE / "summary.md").write_text(summary, encoding="utf-8")
