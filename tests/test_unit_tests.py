@@ -3782,7 +3782,7 @@ class TestBuilderWithSigner(unittest.TestCase):
 
             actions_assertions = [
                 assertion for assertion in assertions
-                if assertion["label"].startswith("c2pa.actions")
+                if assertion["label"].split("__", 1)[0] == "c2pa.actions.v2"
             ]
             self.assertTrue(actions_assertions, "Should have c2pa.actions assertion")
 
@@ -5222,7 +5222,7 @@ class TestBuilderWithSigner(unittest.TestCase):
             # c2pa-rs #2720 (309b99abe) separates synthesized created actions from gathered caller actions.
             actions_assertions = [
                 assertion for assertion in assertions
-                if assertion["label"].startswith("c2pa.actions")
+                if assertion["label"].split("__", 1)[0] == "c2pa.actions.v2"
             ]
             self.assertTrue(actions_assertions)
             actions = []
