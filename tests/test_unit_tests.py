@@ -3745,58 +3745,57 @@ class TestBuilderWithSigner(unittest.TestCase):
             self.assertIsInstance(ingredients_manifest, list)
             self.assertEqual(len(ingredients_manifest), 2, "Should have exactly two ingredients")
 
-            # Verify the first ingredient is the one we added manually with componentOf relationship
-            first_ingredient = ingredients_manifest[0]
-            self.assertEqual(first_ingredient["title"], "Test Ingredient")
-            self.assertEqual(first_ingredient["format"], "image/jpeg")
-            self.assertIn("instance_id", first_ingredient)
-            self.assertIn("thumbnail", first_ingredient)
-            self.assertEqual(first_ingredient["thumbnail"]["format"], "image/jpeg")
-            self.assertIn("identifier", first_ingredient["thumbnail"])
-            self.assertEqual(first_ingredient["relationship"], "componentOf")
-            self.assertIn("label", first_ingredient)
+            # Created/gathered buckets deliberately reorder ingredients (c2pa-rs #2720, 309b99abe).
+            self.assertCountEqual(
+                [ingredient["relationship"] for ingredient in ingredients_manifest],
+                ["parentOf", "componentOf"],
+            )
+            component_ingredient = next(
+                ingredient for ingredient in ingredients_manifest
+                if ingredient["relationship"] == "componentOf"
+            )
+            parent_ingredient = next(
+                ingredient for ingredient in ingredients_manifest
+                if ingredient["relationship"] == "parentOf"
+            )
+            self.assertEqual(component_ingredient["title"], "Test Ingredient")
+            self.assertEqual(component_ingredient["format"], "image/jpeg")
+            self.assertIn("instance_id", component_ingredient)
+            self.assertIn("thumbnail", component_ingredient)
+            self.assertEqual(component_ingredient["thumbnail"]["format"], "image/jpeg")
+            self.assertIn("identifier", component_ingredient["thumbnail"])
+            self.assertEqual(component_ingredient["relationship"], "componentOf")
+            self.assertIn("label", component_ingredient)
 
-            # Verify the second ingredient is the auto-created parent with parentOf relationship
-            second_ingredient = ingredients_manifest[1]
             # Parent ingredient may not have a title field, or may have an empty one
-            self.assertEqual(second_ingredient["format"], "image/jpeg")
-            self.assertIn("instance_id", second_ingredient)
-            self.assertIn("thumbnail", second_ingredient)
-            self.assertEqual(second_ingredient["thumbnail"]["format"], "image/jpeg")
-            self.assertIn("identifier", second_ingredient["thumbnail"])
-            self.assertEqual(second_ingredient["relationship"], "parentOf")
-            self.assertIn("label", second_ingredient)
-
-            # Count ingredients with parentOf relationship - should be exactly one
-            parent_ingredients = [
-                ing for ing in ingredients_manifest
-                if ing.get("relationship") == "parentOf"
-            ]
-            self.assertEqual(len(parent_ingredients), 1, "Should have exactly one parentOf ingredient")
+            self.assertEqual(parent_ingredient["format"], "image/jpeg")
+            self.assertIn("instance_id", parent_ingredient)
+            self.assertIn("thumbnail", parent_ingredient)
+            self.assertEqual(parent_ingredient["thumbnail"]["format"], "image/jpeg")
+            self.assertIn("identifier", parent_ingredient["thumbnail"])
+            self.assertEqual(parent_ingredient["relationship"], "parentOf")
+            self.assertIn("label", parent_ingredient)
 
             # Check that assertions exist
             self.assertIn("assertions", active_manifest)
             assertions = active_manifest["assertions"]
 
-            # Find the actions assertion
-            actions_assertion = None
-            for assertion in assertions:
-                if assertion["label"] in ["c2pa.actions", "c2pa.actions.v2"]:
-                    actions_assertion = assertion
-                    break
-
-            self.assertIsNotNone(actions_assertion, "Should have c2pa.actions assertion")
+            actions_assertions = [
+                assertion for assertion in assertions
+                if assertion["label"].startswith("c2pa.actions")
+            ]
+            self.assertTrue(actions_assertions, "Should have c2pa.actions assertion")
 
             # Verify exactly one c2pa.opened action exists for EDIT intent
-            actions = actions_assertion["data"]["actions"]
             opened_actions = [
-                action for action in actions
+                action for assertion in actions_assertions
+                for action in assertion["data"]["actions"]
                 if action["action"] == "c2pa.opened"
             ]
             self.assertEqual(len(opened_actions), 1, "Should have exactly one c2pa.opened action")
 
             # Verify the c2pa.opened action has the correct structure with parameters and ingredients
-            opened_action = opened_actions[0]
+            opened_action, = opened_actions
             self.assertIn("parameters", opened_action, "c2pa.opened action should have parameters")
             self.assertIn("ingredients", opened_action["parameters"], "parameters should have ingredients array")
             ingredients_params = opened_action["parameters"]["ingredients"]
@@ -3807,6 +3806,7 @@ class TestBuilderWithSigner(unittest.TestCase):
             for ingredient_ref in ingredients_params:
                 self.assertIn("url", ingredient_ref, "Ingredient reference should have url")
                 self.assertIn("hash", ingredient_ref, "Ingredient reference should have hash")
+                self.assertEqual(ingredient_ref["url"].rsplit("/", 1)[-1], parent_ingredient["label"])
 
         builder.close()
 
@@ -5182,7 +5182,7 @@ class TestBuilderWithSigner(unittest.TestCase):
         load_settings('{"builder":{"actions":{"auto_placed_action":{"enabled":true},"auto_opened_action":{"enabled":true},"auto_created_action":{"enabled":true,"source_type":"http://cv.iptc.org/newscodes/digitalsourcetype/digitalCreation"}}}}')
 
     def test_builder_minimal_manifest_add_actions_and_sign_with_auto_add(self):
-        # For testing, remove auto-added actions
+        # Enable auto-added actions.
         load_settings('{"builder":{"actions":{"auto_placed_action":{"enabled":true},"auto_opened_action":{"enabled":true},"auto_created_action":{"enabled":true,"source_type":"http://cv.iptc.org/newscodes/digitalsourcetype/digitalCreation"}}}}')
 
         initial_manifest_definition = {
@@ -5219,36 +5219,36 @@ class TestBuilderWithSigner(unittest.TestCase):
             self.assertIn("assertions", active_manifest)
             assertions = active_manifest["assertions"]
 
-            # Find the c2pa.actions.v2 assertion to look for what we added
-            actions_assertion = None
-            for assertion in assertions:
-                if assertion.get("label") == "c2pa.actions.v2":
-                    actions_assertion = assertion
-                    break
+            # c2pa-rs #2720 (309b99abe) separates synthesized created actions from gathered caller actions.
+            actions_assertions = [
+                assertion for assertion in assertions
+                if assertion["label"].startswith("c2pa.actions")
+            ]
+            self.assertTrue(actions_assertions)
+            actions = []
+            for assertion in actions_assertions:
+                self.assertIn("data", assertion)
+                self.assertIn("actions", assertion["data"])
+                actions.extend(enumerate(assertion["data"]["actions"]))
 
-            self.assertIsNotNone(actions_assertion)
-            self.assertIn("data", actions_assertion)
-            assertion_data = actions_assertion["data"]
-            # Verify the manifest now contains actions
-            self.assertIn("actions", assertion_data)
-            actions = assertion_data["actions"]
-            # Verify "c2pa.created" action exists anywhere in the actions array
-            created_action_found = False
-            for action in actions:
-                if action.get("action") == "c2pa.created":
-                    created_action_found = True
-                    break
+            inception_actions = [
+                (index, action) for index, action in actions
+                if action["action"] in ("c2pa.created", "c2pa.opened")
+            ]
+            self.assertEqual(len(inception_actions), 1, "Should have exactly one inception action")
+            (created_index, created_action), = inception_actions
+            self.assertEqual(created_index, 0, "Inception must be the first action of its assertion")
+            self.assertEqual(created_action["action"], "c2pa.created")
+            self.assertEqual(created_action["digitalSourceType"],
+                             "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCreation")
 
-            self.assertTrue(created_action_found)
-
-            # Verify "c2pa.color_adjustments" action also exists in the same actions array
-            color_adjustments_found = False
-            for action in actions:
-                if action.get("action") == "c2pa.color_adjustments":
-                    color_adjustments_found = True
-                    break
-
-            self.assertTrue(color_adjustments_found)
+            color_adjustments = [
+                action for _, action in actions
+                if action["action"] == "c2pa.color_adjustments"
+            ]
+            self.assertEqual(len(color_adjustments), 1, "Should have exactly one color adjustment")
+            color_adjustment, = color_adjustments
+            self.assertEqual(color_adjustment["parameters"]["name"], "brightnesscontrast")
 
         builder.close()
 
