@@ -131,7 +131,7 @@ def normalize(message):
     message = re.sub(r"\\+", "/", message)
     for folder in (ROOT / "candidate", ROOT / "baseline", ROOT):
         message = message.replace(folder.as_posix(), "<checkout>")
-    temporary = re.escape(Path(tempfile.gettempdir()).as_posix())
+    temporary = re.escape(Path(tempfile.gettempdir()).resolve().as_posix())
     message = re.sub(temporary + r"/tmp[a-zA-Z0-9_-]{8}(?=[/.\s'\"<>:)]|$)", "<temporary>", message)
     return re.sub(r"0x[0-9a-fA-F]+", "0xADDR", message)
 

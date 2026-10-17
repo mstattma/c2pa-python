@@ -36,7 +36,8 @@ class QualificationTests(unittest.TestCase):
                              q.normalize("/work/candidate/test.py 0x456def vs 42"))
             self.assertNotEqual(q.normalize("expected 41"), q.normalize("expected 42"))
         with patch.object(q.tempfile, "gettempdir", return_value="/temp"):
-            self.assertEqual(q.normalize("/temp/tmp12_abcd3/file.jpg"), "<temporary>/file.jpg")
+            temporary = Path("/temp").resolve().as_posix()
+            self.assertEqual(q.normalize(temporary + "/tmp12_abcd3/file.jpg"), "<temporary>/file.jpg")
             self.assertNotEqual(q.normalize("/temp/real-file.jpg"), "<temporary>")
 
     def test_command_propagates_errors_and_only_defers_test_failures(self):
@@ -98,7 +99,7 @@ class QualificationTests(unittest.TestCase):
     def test_qualification_keeps_full_failure_distinct_and_enforces_gates(self):
         for changed, skip_offset in ((False, False), (True, False), (False, True)):
             with self.subTest(changed=changed, skip_offset=skip_offset), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 evidence = root / "evidence"
                 evidence.mkdir()
                 (root / "baseline").mkdir()

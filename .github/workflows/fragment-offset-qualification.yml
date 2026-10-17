@@ -55,7 +55,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Test qualification helpers (no native imports)
-        run: python -m unittest discover -s candidate/scripts -p test_fragment_offset_qualification.py -v
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python -m unittest discover -s candidate/scripts -p test_fragment_offset_qualification.py -v 2>&1 | tee evidence/helper-tests.log
       - name: Build exact native candidate and record evidence
         env:
           CARGO_HOME: ${{ runner.temp }}/fragment-cargo
