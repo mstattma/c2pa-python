@@ -1,0 +1,82 @@
+name: Fork fragment offset qualification
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: >-
+      github.repository == 'mstattma/c2pa-python' &&
+      (github.event.pull_request.author_association == 'OWNER' ||
+       github.event.pull_request.author_association == 'MEMBER' ||
+       github.event.pull_request.author_association == 'COLLABORATOR' ||
+       contains(github.event.pull_request.labels.*.name, 'safe to test'))
+    name: Fragment offset (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      PIP_NO_CACHE_DIR: "1"
+      PYTHONUNBUFFERED: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact PR Python
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Checkout exact baseline Python
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+          persist-credentials: false
+      - name: Checkout allowlisted native source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: mstattma/c2pa-rs
+          ref: 20d7c45972976c32ab24d5d4ac33e7be826ce1be
+          path: native
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Test qualification helpers (no native imports)
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python -m unittest discover -s candidate/scripts -p test_fragment_offset_qualification.py -v 2>&1 | tee evidence/helper-tests.log
+      - name: Build exact native candidate and record evidence
+        env:
+          CARGO_HOME: ${{ runner.temp }}/fragment-cargo
+        run: python candidate/scripts/fragment_offset_qualification.py build
+      - name: Install Python-only test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install -r candidate/requirements.txt pytest toml requests
+          python -m pip install --no-deps -e candidate
+      - name: Stock compatibility, same-binary baseline and PR, focused offsets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python candidate/scripts/fragment_offset_qualification.py qualify
+      - name: Retain qualification evidence (not a release)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fragment-offset-${{ matrix.os }}-${{ github.event.pull_request.head.sha }}
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
