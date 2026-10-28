@@ -237,7 +237,9 @@ except Exception as err:
 
 ### Verify one fragment of a single-file fragmented MP4
 
-A single-file fragmented MP4 (for example one served as HLS byte ranges) hashes each fragment together with its absolute byte offset in the file. To verify one fragment on its own, pass the bytes before the first C2PA `merkle` box as the init stream, the fragment from its `merkle` box up to the next one, and the fragment's offset in the original file:
+A single-file fragmented MP4 (for example one served as HLS byte ranges) can be verified one fragment at a time by supplying the init stream, segment buffer, and offset. The offset is the absolute byte position of the supplied segment buffer's first byte in the original single-file signed asset. The verifier adds this offset to each included root box's position within the segment buffer to reproduce its signed position.
+
+The buffer must reproduce the selected leaf's included bytes and root-box offsets. UUID-to-UUID cuts are the documented recipe for the current default-exclusion layout. For that recipe, pass the bytes before the first C2PA `merkle` uuid box as the init stream and the fragment from its `merkle` uuid box up to the next one (or the end of the file) as the segment buffer. When a segment-local `sidx` is fully excluded by the signed assertion, the buffer may begin with that `sidx`; pass its absolute position as the starting offset. The required Merkle information must still be in the buffer.
 
 ```py
 if c2pa.has_fragment_at_offset():
@@ -248,7 +250,9 @@ if c2pa.has_fragment_at_offset():
             print(reader.get_validation_state())
 ```
 
-A wrong cut or offset is reported as `assertion.bmffHash.mismatch` in the validation results rather than raised. An offset of `0` behaves like `Reader.with_fragment()` for fragments stored as separate files. `has_fragment_at_offset()` is `False` when the native library predates this API; the methods then raise `C2paError.NotSupported`.
+With a valid init and a parseable segment, hash failures caused by a wrong cut or offset are reported as `assertion.bmffHash.mismatch` in the validation results rather than raised. Segment-parsing failures also appear in validation results; initialization-loading errors can raise `C2paError`. An offset of `0` behaves like `Reader.with_fragment()` for fragments stored as separate files. `has_fragment_at_offset()` is `False` when the native library predates this API; the methods then raise `C2paError.NotSupported`.
+
+[specs-core#2642](https://github.com/c2pa-org/specs-core/issues/2642) proposes segment-coherent hash boundaries. The offset parameter remains applicable wherever binding includes absolute box positions.
 
 ### Add a signed manifest to a stream
 

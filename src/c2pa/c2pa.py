@@ -3489,21 +3489,34 @@ class Reader(ManagedResource):
         """Process one fragment of a single-file fragmented BMFF asset,
         verified at its absolute byte offset in that asset.
 
-        A single-file fragmented MP4 hashes its fragments together with their
-        absolute root-box offsets, so a byte-range slice of it (for example an
-        HLS ``EXT-X-BYTERANGE`` segment) only verifies when the verifier knows
-        where the slice sat in the file. ``fragment_offset=0`` behaves like
-        :meth:`with_fragment`.
+        The offset is the absolute byte position of the supplied segment
+        buffer's first byte in the original single-file signed asset. The
+        verifier adds this offset to each included root box's position within
+        the segment buffer to reproduce its signed position.
+        ``fragment_offset=0`` behaves like :meth:`with_fragment`.
 
-        With the default exclusions, ``stream`` holds every byte before the
-        first C2PA ``merkle`` uuid box, and ``fragment_stream`` starts at a
-        ``merkle`` uuid box and ends right before the next one (or at the end
-        of the file). With a valid init and a parseable fragment, hash failures
-        caused by a wrong cut or offset are reported as
-        ``assertion.bmffHash.mismatch`` rather than raising. Init-loading or
-        fragment-parsing errors raise ``C2paError``. The offset is supplied by
+        The buffer must reproduce the selected leaf's included bytes and
+        root-box offsets. UUID-to-UUID cuts are the documented recipe for the
+        current default-exclusion layout. For that recipe, ``stream`` holds
+        every byte before the first C2PA ``merkle`` uuid box, and
+        ``fragment_stream`` starts at a ``merkle`` uuid box and ends right
+        before the next one (or at the end of the file).
+        When a segment-local ``sidx`` is fully excluded by the signed assertion,
+        the buffer may begin with that ``sidx``; pass its absolute position as
+        the starting offset. The required Merkle information must still be in
+        the buffer.
+
+        With a valid init and a parseable fragment, hash failures caused by
+        a wrong cut or offset are reported as
+        ``assertion.bmffHash.mismatch`` rather than raising. Segment-parsing
+        failures also appear in validation results; initialization-loading
+        errors can raise ``C2paError``. The offset is supplied by
         the caller; it proves the bytes belong to the Merkle leaf they name,
         not where they were fetched from.
+
+        https://github.com/c2pa-org/specs-core/issues/2642 proposes
+        segment-coherent hash boundaries. The offset parameter remains
+        applicable wherever binding includes absolute box positions.
 
         Settings and trust come from this reader's Context.
 
@@ -3549,10 +3562,16 @@ class Reader(ManagedResource):
         """Create a Reader for one fragment of a single-file fragmented
         BMFF asset, verified at its absolute byte offset.
 
+        The offset is the absolute byte position of the supplied segment
+        buffer's first byte in the original single-file signed asset. The
+        verifier adds this offset to each included root box's position within
+        the segment buffer to reproduce its signed position.
+
         Unlike ``Reader(format, init_stream, context=...)`` followed by
         :meth:`with_fragment_at_offset`, the init stream is not read and
         validated on its own first. See :meth:`with_fragment_at_offset` for
-        the cut rules and result semantics.
+        the buffer requirements, default-exclusion cut recipe, and result
+        semantics.
 
         Args:
             format: MIME type of the media (e.g., "video/mp4").
